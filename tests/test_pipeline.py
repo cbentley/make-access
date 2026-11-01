@@ -10,7 +10,7 @@ import pikepdf
 import pytest
 from PIL import Image, ImageCms
 
-import convert_images as ci
+import make_access as ci
 
 ADOBE_RGB_PROFILE = Path("/usr/share/color/icc/AdobeCompat-v2.icc")  # From icc-profiles-free
 BACKGROUND = (216, 192, 144)  # Background color of generated images, as 8-bit RGB

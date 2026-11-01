@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageCms
 
-import convert_images as ci
+import make_access as ci
 
 
 def touch(folder: Path, *names: str) -> None:

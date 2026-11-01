@@ -5,7 +5,7 @@ from pathlib import Path
 import pikepdf
 import pytest
 
-import convert_images as ci
+import make_access as ci
 
 MB = 1_000_000
 

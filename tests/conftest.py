@@ -2,7 +2,7 @@ import logging
 
 import pytest
 
-import convert_images as ci
+import make_access as ci
 
 
 @pytest.fixture(autouse=True)

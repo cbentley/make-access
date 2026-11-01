@@ -1,6 +1,6 @@
 # ICC profiles
 
-`sRGB-v2-micro.icc` is the sRGB profile `convert_images.py` converts every image to and embeds in its output (`SRGB_PROFILE`). At 456 bytes it's much smaller than a standard sRGB profile (~7 KB), which saves that much in every JPEG and PDF page. Converting with it differs from the standard `sRGB.icc` by at most 1 level of 255.
+`sRGB-v2-micro.icc` is the sRGB profile `make_access.py` converts every image to and embeds in its output (`SRGB_PROFILE`). At 456 bytes it's much smaller than a standard sRGB profile (~7 KB), which saves that much in every JPEG and PDF page. Converting with it differs from the standard `sRGB.icc` by at most 1 level of 255.
 
 - Source: [Compact-ICC-Profiles](https://github.com/saucecontrol/Compact-ICC-Profiles) by Clinton Ingram
 - License: CC0-1.0 (public domain)

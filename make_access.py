@@ -3,7 +3,7 @@
 Convert folders of images into OCR-processed, size-limited PDFs, JPEGs and/or JPEG 2000 files.
 
 Usage:
-    python convert_images.py <folder> -f pdf,jpg,jp2 [options]   (one or more of pdf, jpg, jp2)
+    python make_access.py <folder> -f pdf,jpg,jp2 [options]   (one or more of pdf, jpg, jp2)
 
 See README.md for full documentation.
 """
@@ -98,7 +98,7 @@ OCR_OPTS = [
 # LOGGING SETUP
 # ============================================================
 
-logger = logging.getLogger("convert_images")
+logger = logging.getLogger("make_access")
 
 # Inside the input folder; starts with "_" so it's never searched for images
 LOGS_DIR_NAME = "_logs"

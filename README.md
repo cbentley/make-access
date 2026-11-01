@@ -27,7 +27,7 @@ To work on the script, install `requirements-dev.txt` instead: it includes `requ
 ## Usage
 
 ```bash
-python convert_images.py <folder> -f <format>[,<format>...] [options]
+python make_access.py <folder> -f <format>[,<format>...] [options]
 ```
 
 `<folder>` is the folder with the scans, and `-f` (or `--format`) says what to make: one or more formats, in any order, separated by commas (no spaces, or put the list in quotes):
@@ -49,10 +49,10 @@ Options for PDFs (an error without `-f pdf`):
 The folder and the options can be given in any order. Examples:
 
 ```bash
-python convert_images.py /path/to/images -f pdf --ocr-lang=eng --max-mb=150
-python convert_images.py /path/to/images -f pdf,jpg,jp2
-python convert_images.py . -f jpg
-python convert_images.py -f jp2 /path/to/images
+python make_access.py /path/to/images -f pdf --ocr-lang=eng --max-mb=150
+python make_access.py /path/to/images -f pdf,jpg,jp2
+python make_access.py . -f jpg
+python make_access.py -f jp2 /path/to/images
 ```
 
 ## What it does
@@ -102,7 +102,7 @@ Needs `requirements-dev.txt` (see Setup). The integration tests generate their o
 
 ## Configuration
 
-Settings that aren't command-line options are constants at the top of `convert_images.py`:
+Settings that aren't command-line options are constants at the top of `make_access.py`:
 
 | Constant                  | Controls                                                              |
 | ------------------------- | --------------------------------------------------------------------- |

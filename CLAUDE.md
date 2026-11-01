@@ -4,15 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-A single-file CLI (`convert_images.py`) that turns folders of scanned images (`.tif/.tiff/.jpg/.jpeg/.jp2/.jpf`) into OCR'd, size-capped PDFs, standalone JPEGs and/or JPEG 2000 files, chosen with `-f` (comma-separated, any order: `pdf`, `jpg`, `jp2`; `jpeg` is accepted as `jpg`); the input folder is the positional argument. `README.md` documents user-facing behavior and options.
+A single-file CLI (`make_access.py`) that turns folders of scanned images (`.tif/.tiff/.jpg/.jpeg/.jp2/.jpf`) into OCR'd, size-capped PDFs, standalone JPEGs and/or JPEG 2000 files, chosen with `-f` (comma-separated, any order: `pdf`, `jpg`, `jp2`; `jpeg` is accepted as `jpg`); the input folder is the positional argument. `README.md` documents user-facing behavior and options.
 
 ## Setup & running
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # pikepdf, img2pdf, Pillow
-python convert_images.py /path/to/images -f pdf[,jpg][,jp2] [--max-mb=100] [--ocr-lang=deu+eng] [--no-ocr]
-python convert_images.py /path/to/images -f jpg,jp2
+python make_access.py /path/to/images -f pdf[,jpg][,jp2] [--max-mb=100] [--ocr-lang=deu+eng] [--no-ocr]
+python make_access.py /path/to/images -f jpg,jp2
 ```
 
 External tools must be on PATH: ImageMagick, OCRmyPDF (with Ghostscript and Tesseract language packs), and `pngquant` (needed by OCRmyPDF for `--optimize 2/3`). `jbig2` is unused, since every page is JPEG and OCRmyPDF only applies JBIG2 to 1-bit images. `validate_external_tools()` checks ImageMagick and the sRGB profile (`SRGB_PROFILE`, in the repo) at startup, plus OCRmyPDF for PDFs (not `pngquant`) and, when JPEG 2000 is made, that Pillow has its OpenJPEG codec (`pillow_writes_jp2`; PyPI's wheels include it).
@@ -56,7 +56,7 @@ Implementation notes:
 
 ## In progress: sharing the script with a non-programmer coworker on Windows/WSL
 
-**Unblocked:** `convert_images.py` (`pdf`/`jpg` subcommands, `pdf/` and `jpg/` output folders) is merged to `main` (`95bb779`). The steps below are updated for it: the new name, a choice of PDF, JPEGs or both, and a self-test covering both outputs. The GitHub repo has been renamed from `image-to-pdf` to `convert-images` (the old URL redirects); the paths below use the new name.
+**Unblocked:** the script (then `convert_images.py`, now `make_access.py`; `pdf`/`jpg` subcommands, `pdf/` and `jpg/` output folders) is merged to `main` (`95bb779`). The steps below are updated for it: a choice of PDF, JPEGs or both, and a self-test covering both outputs. The GitHub repo was renamed from `image-to-pdf` to `convert-images` and is being renamed to `make-access` (old URLs redirect); the paths below use the new name.
 
 Goal: a coworker who isn't a programmer runs the script on their Windows PC through WSL (Ubuntu) without ever using a terminal. It must work reliably, so every step is scripted and tested, and anything that can't be tested from the Mac is listed for the handover test.
 
@@ -64,7 +64,7 @@ Goal: a coworker who isn't a programmer runs the script on their Windows PC thro
 
 - **Run inside WSL Ubuntu**, not native Windows (ImageMagick/OCRmyPDF/Tesseract are painful to install there) and not Docker (too much to support for a non-programmer). Fallback if WSL proves unreliable: run the script on a machine we control and have the coworker drop scans into a shared watched folder.
 - **Ubuntu version: an LTS, installed by explicit name** (e.g. `wsl --install -d Ubuntu-26.04`; check exact names with `wsl --list --online`). Plain `wsl --install` gives whatever "Ubuntu" currently points to, and a non-LTS or future release may bring a Python that `pikepdf>=10.0.2,<10.1` has no wheels for. The pipeline as of `f5be165` was tested on 22.04, 24.04 and 26.04; everything since has only run on 26.04 (see Testing).
-- **Install from a git clone** of the public repo (`https://github.com/cbentley/convert-images`, HTTPS so no credentials) into `~/convert-images` inside WSL, tracking `main`, with the venv at `env/`. Updates are `git pull` plus `pip install -r requirements.txt`. Nothing generated for this machine (launchers, paths, distro name) may be written into tracked files, or `git pull` will conflict.
+- **Install from a git clone** of the public repo (`https://github.com/cbentley/make-access`, HTTPS so no credentials) into `~/make-access` inside WSL, tracking `main`, with the venv at `env/`. Updates are `git pull` plus `pip install -r requirements.txt`. Nothing generated for this machine (launchers, paths, distro name) may be written into tracked files, or `git pull` will conflict.
 - **Desktop icons are Windows shortcuts (`.lnk`) that start `wsl.exe` directly; all logic lives in bash scripts in the repo.** Not `.bat` files, because:
   - cmd.exe splits a dragged path containing `&` (Explorer only quotes dragged paths that contain spaces);
   - capturing `wsl.exe` output in a `.bat` (`for /f`) garbles non-ASCII text: `wsl.exe` writes its own messages as UTF-16 unless `WSL_UTF8=1` is set ([microsoft/WSL#4607](https://github.com/microsoft/WSL/issues/4607));
@@ -81,7 +81,7 @@ Goal: a coworker who isn't a programmer runs the script on their Windows PC thro
 - `27d8604` natural page order (`scan_2` before `scan_10`, case ignored; close to, but not exactly, Windows Explorer's order).
 - `66521dd` ImageMagick → JPEG → img2pdf. Verified on Ubuntu 24.04 and 22.04 against the old output: identical decoded pixels, page sizes, rotation, colors (incl. CMYK) and OCR text; final PDFs ~24% smaller (no thumbnail / opaque SMask per page). Also runs on Ubuntu 26.04 with the same page sizes.
 - `f5be165` PDF pages keep the scanned object's real size (original pixels ÷ DPI, read before resizing; `-density 300` and the `-resize` cap commented out), and `IMAGEMAGICK_CMD` picks `magick` when available.
-- `95bb779` (branch `feat/convert-images`, fast-forwarded): rename to `convert_images.py` with `pdf`/`jpg` subcommands and `pdf/`/`jpg/` output folders; `.jpf` input; `main()` split into folder-processing functions; pytest suite with generated images; metadata stripped from all outputs; `-auto-orient`; web-sized progressive JPEGs; the compact sRGB profile in `profiles/` (so `icc-profiles-free` is no longer needed); `--no-ocr` ignores `--ocr-lang`.
+- `95bb779` (branch `feat/convert-images`, fast-forwarded): rename to `convert_images.py` (now `make_access.py`) with `pdf`/`jpg` subcommands and `pdf/`/`jpg/` output folders; `.jpf` input; `main()` split into folder-processing functions; pytest suite with generated images; metadata stripped from all outputs; `-auto-orient`; web-sized progressive JPEGs; the compact sRGB profile in `profiles/` (so `icc-profiles-free` is no longer needed); `--no-ocr` ignores `--ocr-lang`.
 - **Only tested on ImageMagick 7.1.2 (Ubuntu 26.04):** everything ImageMagick-related since `66521dd`, including JPEG 2000 output (ImageMagick writing `pnm:`, gray/bilevel detection): reading size/DPI/orientation with `-ping -format`, `-auto-orient`, `+profile '!icc,*'`, `+set comment`, `-interlace JPEG`, and page sizes. Run the test suite on 22.04/24.04 (ImageMagick 6) before the handover (step 0).
 
 ### Remaining steps
@@ -91,16 +91,16 @@ Goal: a coworker who isn't a programmer runs the script on their Windows PC thro
    - Folder: use `$1` if given (dropped on the icon); otherwise open a Windows folder picker by calling `powershell.exe` from WSL (`System.Windows.Forms.FolderBrowserDialog`; set `[Console]::OutputEncoding` to UTF-8 so umlauts survive, strip the trailing `\r`, and give the dialog a topmost owner window so it doesn't open behind the console). Cancel → exit cleanly.
    - Convert with `wslpath -a`, then check the folder exists (`[ -d ]`). If not, explain in plain words: UNC paths (`\\server\share`) don't convert, and mapped drive letters (`S:\`) convert to `/mnt/s`, which doesn't exist in WSL; ask them to copy the scans to a local folder like `C:\Scans`.
    - Prompts (`read -r -p`): what to make, any combination of PDF / JPEGs / JPEG 2000 (default to agree on with Chris; the JPEGs or JPEG 2000 files are the access copies for Rosetta) → `-f` with `pdf`, `jpg` and/or `jp2`. Only when a PDF is made: max MB `[100]`, OCR languages `[deu+eng]`, recognize text `(Y/n)` → `--max-mb`, `--ocr-lang`, `--no-ocr`. Validate the MB value is a whole number and re-ask otherwise.
-   - Run `"$HOME/convert-images/env/bin/python" "$HOME/convert-images/convert_images.py" "$folder" -f <formats> <options>` (formats comma-separated) with every variable quoted.
+   - Run `"$HOME/make-access/env/bin/python" "$HOME/make-access/make_access.py" "$folder" -f <formats> <options>` (formats comma-separated) with every variable quoted.
    - Exit code 0 → "All done." (naming what was made: PDFs and JPEGs in the `access` folders); anything else → "Some folders failed. Please send Chris the newest file in the _logs folder inside <folder>." Then `read -r -p "Press Enter to close this window"`, so the window never closes before they've read the result.
-2. **`windows/update.sh`:** `git -C "$HOME/convert-images" pull --ff-only`, then `env/bin/pip install -r requirements.txt`; print a clear success or failure message and wait for Enter.
+2. **`windows/update.sh`:** `git -C "$HOME/make-access" pull --ff-only`, then `env/bin/pip install -r requirements.txt`; print a clear success or failure message and wait for Enter.
 3. **`setup.sh`** at the repo root, run once inside their WSL; must be safe to re-run:
    - `sudo apt update`, then `sudo apt install -y imagemagick ocrmypdf pngquant tesseract-ocr-deu tesseract-ocr-eng python3-venv git` (only the needed language packs; `tesseract-ocr-all` is huge). `sudo` asks for the coworker's WSL (Linux) password, so run setup together with them.
    - create `env/` and `pip install -r requirements.txt`
    - self-test: generate a few small images at runtime with `magick`, or `convert` on ImageMagick 6 (don't commit binaries), run `-f pdf,jpg` on them, and check both outputs: a PDF with a text layer (e.g. pikepdf: every page has a `/Font` resource) and one JPEG per image with the sRGB profile. End with a clear "Setup OK" or a plain error. (The integration tests do the same more thoroughly, but need `requirements-dev.txt`.)
    - create the two desktop shortcuts by calling `powershell.exe` (`WScript.Shell` → `CreateShortcut`). Find the desktop with `[Environment]::GetFolderPath('Desktop')` (it may be redirected to OneDrive), and pass Windows paths to PowerShell via `wslpath -w`.
-     - "Convert Scans" (name to confirm): target `C:\Windows\System32\wsl.exe`, arguments `-d <distro> --cd ~ --exec /home/<user>/convert-images/windows/run.sh`
-     - "Update Convert Scans": the same with `windows/update.sh`
+     - "Make Access Copies": target `C:\Windows\System32\wsl.exe`, arguments `-d <distro> --cd ~ --exec /home/<user>/make-access/windows/run.sh`
+     - "Update - Make Access Copies": the same with `windows/update.sh`
      - Take `<distro>` from `$WSL_DISTRO_NAME` and the path from `$HOME`. `--exec` doesn't expand `~` in the command itself, so it must be an absolute path.
 4. **Handover on their machine** (none of the Windows side can be tested from the Mac):
    - First confirm `wsl -l -v` shows VERSION 2 and an LTS Ubuntu.

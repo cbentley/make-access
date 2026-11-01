@@ -1,4 +1,4 @@
-"""End-to-end tests: run main() on images generated with ImageMagick and check the PDFs and JPEGs.
+"""End-to-end tests: run main() on images generated with ImageMagick and check the PDFs, JPEGs and JPEG 2000 files.
 Skipped if ImageMagick, the sRGB profile, OCRmyPDF or Tesseract's English data is missing."""
 import io
 import os
@@ -89,13 +89,36 @@ def points(pixels: int, dpi: float) -> float:
     return pixels / dpi * 72
 
 
+def jp2_bit_depth(path: Path) -> int:
+    """Bits per component from a JP2 file's image header box."""
+    data = path.read_bytes()
+    ihdr = data.index(b"ihdr") + 4  # Height (4 bytes), width (4), components (2), then bits per component - 1
+    return data[ihdr + 10] + 1
+
+
+def jp2_coding(path: Path) -> dict:
+    """Coding settings from a JP2 file's codestream: COD marker segment and whether PLT markers are present."""
+    data = path.read_bytes()
+    codestream = data.index(b"\xff\x4f\xff\x51")  # SOC marker, then SIZ
+    cod = data.index(b"\xff\x52", codestream)
+    # COD: marker (2), length (2), coding style (1), progression (1), layers (2), color transform (1),
+    # decomposition levels (1), code-block width (1), height (1), code-block style (1), wavelet (1)
+    return {
+        "progression": ["LRCP", "RLCP", "RPCL", "PCRL", "CPRL"][data[cod + 5]],
+        "color_transform": bool(data[cod + 8]),
+        "wavelet": "5/3" if data[cod + 13] else "9/7",
+        "plt": b"\xff\x58" in data[cod:],
+    }
+
+
 # --- Full run: mixed image types, PDF and JPEG ---
 
 # (filename, width, height, ImageMagick options, expected DPI of the page size).
 # Widths differ so each page can be identified in the PDF; names check natural sort order (p10 last).
 MIXED_IMAGES = [
     ("p1_rgb.tif", 600, 400, dpi_opts(300), 300),
-    ("p2_gray.tif", 620, 400, ["-colorspace", "Gray", *dpi_opts(118.11, "PixelsPerCentimeter")], 118.11 * 2.54),
+    ("p2_gray.tif", 620, 400, ["-colorspace", "Gray", "-type", "Grayscale", "-depth", "8",
+                               *dpi_opts(118.11, "PixelsPerCentimeter")], 118.11 * 2.54),
     ("p3_cmyk.tif", 640, 400, ["-colorspace", "CMYK", *dpi_opts(300)], 300),
     ("p4_nodpi.jp2", 660, 400, [], ci.FALLBACK_DPI),  # OpenJPEG stores no DPI
     ("p5.jpf", 680, 400, [], ci.FALLBACK_DPI),
@@ -106,7 +129,7 @@ MIXED_IMAGES = [
 
 @pytest.fixture(scope="module")
 def mixed_run(tmp_path_factory):
-    """Run pdf --jpg once on a folder of mixed images (plus an EXIF-rotated JPEG and an excluded ruler)."""
+    """Run pdf --jpg --jp2 once on a folder of mixed images (plus an EXIF-rotated JPEG and an excluded ruler)."""
     root = tmp_path_factory.mktemp("mixed")
     scratch = tmp_path_factory.mktemp("scratch")  # Intermediate images, outside the input folder
     folder = root / "b01" / "master"
@@ -127,7 +150,7 @@ def mixed_run(tmp_path_factory):
     make_image(folder / "ruler.tif", 300, 100)
     make_image(root / "other" / "scan.tif", 600, 400, *dpi_opts(300))
 
-    exit_code = run("pdf", str(root), "--jpg", "--ocr-lang", "eng")
+    exit_code = run(str(root), "-f", "pdf,jpg,jp2", "--ocr-lang", "eng")
     return root, folder, exit_code
 
 
@@ -191,9 +214,37 @@ def test_mixed_run_jpegs(mixed_run):
 
 
 @needs_ocr
-def test_mixed_run_untagged_rgb_keeps_its_colors(mixed_run):
+def test_mixed_run_jp2s(mixed_run):
     _, folder, _ = mixed_run
-    with Image.open(folder.parent / "access" / "p1_rgb.jpg") as im:
+    jp2_dir = folder.parent / "access"
+    names = {name.rsplit(".", 1)[0] for name, *_ in MIXED_IMAGES} | {"p7_exif6"}
+    assert {p.stem for p in jp2_dir.glob("*.jp2")} == names
+
+    expected = {  # name: (mode, DPI, size)
+        "p1_rgb": ("RGB", 300, (600, 400)),
+        "p2_gray": ("L", 300, (620, 400)),
+        "p3_cmyk": ("RGB", 300, (640, 400)),  # JP2 has no CMYK
+        "p4_nodpi": ("RGB", None, (660, 400)),  # No DPI in, no DPI out
+        "p7_exif6": ("RGB", 300, (400, 740)),  # Upright
+        "p10_rgb16": ("RGB", 400, (720, 400)),
+    }
+    for name, (mode, dpi, size) in expected.items():
+        path = jp2_dir / f"{name}.jp2"
+        with Image.open(path) as im:
+            assert im.mode == mode, name
+            assert im.size == size, name
+            if dpi is None:
+                assert "dpi" not in im.info, name
+            else:
+                assert im.info["dpi"] == pytest.approx((dpi, dpi), abs=0.01), name
+        assert jp2_bit_depth(path) == 8, name
+
+
+@needs_ocr
+@pytest.mark.parametrize("ext", ["jpg", "jp2"])
+def test_mixed_run_untagged_rgb_keeps_its_colors(mixed_run, ext):
+    _, folder, _ = mixed_run
+    with Image.open(folder.parent / "access" / f"p1_rgb.{ext}") as im:
         assert im.getpixel((5, 5)) == pytest.approx(BACKGROUND, abs=3)
 
 
@@ -212,7 +263,7 @@ def test_mixed_run_logs_multi_image_file(mixed_run):
 def test_adobe_rgb_is_converted_to_srgb(tmp_path):
     # -profile on an untagged image assigns the profile: the pixels keep BACKGROUND, now meaning Adobe RGB
     make_image(tmp_path / "adobe.tif", 600, 400, "-profile", str(ADOBE_RGB_PROFILE))
-    assert run("jpg", str(tmp_path)) == 0
+    assert run(str(tmp_path), "-f", "jpg") == 0
 
     adobe_to_srgb = ImageCms.buildTransform(str(ADOBE_RGB_PROFILE), str(ci.SRGB_PROFILE), "RGB", "RGB")
     expected = ImageCms.applyTransform(Image.new("RGB", (1, 1), BACKGROUND), adobe_to_srgb).getpixel((0, 0))
@@ -235,7 +286,7 @@ def test_metadata_is_stripped(tmp_path, monkeypatch):
     (tmp_path / "in").mkdir()
     with Image.open(make_image(tmp_path / "gen" / "a.tif", 600, 400, "-depth", "8")) as im:
         im.convert("RGB").save(tmp_path / "in" / "a.jpg", exif=exif, comment=b"scan note", dpi=(300, 300))
-    assert run("pdf", str(tmp_path / "in"), "--jpg", "--no-ocr") == 0
+    assert run(str(tmp_path / "in"), "-f", "pdf,jpg", "--no-ocr") == 0
 
     with Image.open(tmp_path / "in" / "access" / "a.jpg") as im:
         assert 0x0112 not in im.getexif()
@@ -291,13 +342,14 @@ def test_orientation_tag_is_applied(tmp_path, orientation, size, corner):
     # Stored 300x200 at 300x150 DPI: 1 x 1.333 inches, so 1.333 x 1 inches when turned by 90°
     make_marked_image(tmp_path / "in" / "a.tif", "-units", "PixelsPerInch", "-density", "300x150",
                       "-orient", orientation)
-    assert run("pdf", str(tmp_path / "in"), "--jpg", "--no-ocr") == 0
+    assert run(str(tmp_path / "in"), "-f", "pdf,jpg,jp2", "--no-ocr") == 0
 
     turned = size == (200, 300)
-    with Image.open(tmp_path / "in" / "access" / "a.jpg") as im:
-        assert im.size == size
-        assert red_corner(im) == corner
-        assert im.info["dpi"] == pytest.approx((150, 300) if turned else (300, 150), abs=1)
+    for ext in ("jpg", "jp2"):
+        with Image.open(tmp_path / "in" / "access" / f"a.{ext}") as im:
+            assert im.size == size, ext
+            assert red_corner(im) == corner, ext
+            assert im.info["dpi"] == pytest.approx((150, 300) if turned else (300, 150), abs=1), ext
     (page,) = page_info(tmp_path / "in" / "access" / "in.pdf")
     assert page["pixels"] == size
     assert page["rotate"] == 0
@@ -313,8 +365,9 @@ def test_orientation_tag_is_applied(tmp_path, orientation, size, corner):
 def test_resize_keeps_real_size(tmp_path, monkeypatch):
     monkeypatch.setattr(ci, "PDF_MAX_SIZE", 300)
     monkeypatch.setattr(ci, "JPG_MAX_SIZE", 200)
+    monkeypatch.setattr(ci, "JP2_MAX_SIZE", 400)
     make_image(tmp_path / "a.tif", 600, 400, *dpi_opts(300))
-    assert run("pdf", str(tmp_path), "--jpg", "--no-ocr") == 0
+    assert run(str(tmp_path), "-f", "pdf,jpg,jp2", "--no-ocr") == 0
 
     (page,) = page_info(tmp_path / "access" / f"{tmp_path.name}.pdf")
     assert page["pixels"] == (300, 200)
@@ -322,6 +375,9 @@ def test_resize_keeps_real_size(tmp_path, monkeypatch):
     with Image.open(tmp_path / "access" / "a.jpg") as im:
         assert im.size == (200, 133)
         assert im.info["dpi"] == pytest.approx((100, 100), abs=1)  # 300 DPI scaled by 200/600
+    with Image.open(tmp_path / "access" / "a.jp2") as im:
+        assert im.size == (400, 267)
+        assert im.info["dpi"] == pytest.approx((200, 200), abs=0.01)  # 300 DPI scaled by 400/600
 
 
 # --- Splitting ---
@@ -330,7 +386,7 @@ def test_resize_keeps_real_size(tmp_path, monkeypatch):
 def test_large_pdf_is_split_under_max_mb(tmp_path):
     for i in range(1, 7):
         make_noise_image(tmp_path / f"noise{i}.tif", 1000)
-    assert run("pdf", str(tmp_path), "--max-mb", "1", "--no-ocr") == 0
+    assert run(str(tmp_path), "-f", "pdf", "--max-mb", "1", "--no-ocr") == 0
 
     parts = sorted((tmp_path / "access").iterdir())
     assert len(parts) > 1
@@ -345,7 +401,7 @@ def test_large_pdf_is_split_under_max_mb(tmp_path):
 @needs_ocr
 def test_no_ocr_ignores_missing_language(tmp_path):
     make_image(tmp_path / "a.tif")
-    assert run("pdf", str(tmp_path), "--no-ocr", "--ocr-lang", "xyz") == 0
+    assert run(str(tmp_path), "-f", "pdf", "--no-ocr", "--ocr-lang", "xyz") == 0
     (page,) = page_info(tmp_path / "access" / f"{tmp_path.name}.pdf")
     assert not page["text"]
     assert "Ignoring --ocr-lang xyz" in log_text(tmp_path)
@@ -357,9 +413,93 @@ def test_no_ocr_ignores_missing_language(tmp_path):
 def test_jpg_only_makes_no_pdf(tmp_path):
     make_image(tmp_path / "a.tif")
     make_image(tmp_path / "b.jpg")
-    assert run("jpg", str(tmp_path)) == 0
+    assert run(str(tmp_path), "-f", "jpg") == 0
     assert sorted(p.name for p in (tmp_path / "access").iterdir()) == ["a.jpg", "b.jpg"]
     assert not (tmp_path / "_work").exists()
+
+
+# --- JPEG 2000 ---
+
+@needs_imagemagick
+def test_jp2_only_makes_lossy_jp2s(tmp_path):
+    make_image(tmp_path / "a.tif", 600, 400, *dpi_opts(300))
+    make_image(tmp_path / "b.jpg")
+    assert run(str(tmp_path), "-f", "jp2") == 0
+    access = tmp_path / "access"
+    assert sorted(p.name for p in access.iterdir()) == ["a.jp2", "b.jp2"]
+    assert not (tmp_path / "_work").exists()
+    # Lossy: much smaller than the uncompressed pixels
+    assert (access / "a.jp2").stat().st_size < 600 * 400 * 3 / 10
+
+
+@needs_imagemagick
+def test_jp2_lossless_keeps_pixels(tmp_path, monkeypatch):
+    monkeypatch.setattr(ci, "JP2_QUALITY", None)
+    make_image(tmp_path / "in" / "a.tif", 300, 200, "-depth", "8")
+    assert run(str(tmp_path / "in"), "-f", "jp2") == 0
+    with Image.open(tmp_path / "in" / "a.tif") as original, Image.open(tmp_path / "in" / "access" / "a.jp2") as im:
+        assert im.convert("RGB").tobytes() == original.convert("RGB").tobytes()
+    assert jp2_coding(tmp_path / "in" / "access" / "a.jp2")["wavelet"] == "5/3"
+
+
+@needs_imagemagick
+@pytest.mark.parametrize("name, opts, mode, color_transform", [
+    ("rgb.tif", [], "RGB", True),
+    ("gray.tif", ["-colorspace", "Gray", "-type", "Grayscale", "-depth", "8"], "L", False),
+    ("gray-pixels-in-rgb.tif", ["-colorspace", "Gray"], "L", False),  # Stored as RGB; written as gray, like JPEGs
+    ("bilevel.tif", ["-type", "Bilevel"], "L", False),  # 1-bit; written as 8-bit gray
+])
+def test_jp2_coding(tmp_path, name, opts, mode, color_transform):
+    make_image(tmp_path / name, 300, 200, *opts)
+    assert run(str(tmp_path), "-f", "jp2") == 0
+    jp2 = tmp_path / "access" / name.replace(".tif", ".jp2")
+    with Image.open(jp2) as im:
+        assert im.mode == mode
+    assert jp2_bit_depth(jp2) == 8
+    assert jp2_coding(jp2) == {"progression": "RPCL", "color_transform": color_transform, "wavelet": "9/7",
+                               "plt": True}
+    assert sorted(p.name for p in (tmp_path / "access").iterdir()) == [jp2.name]  # No PNM left over
+
+
+@needs_imagemagick
+def test_jp2_drops_alpha(tmp_path):
+    make_image(tmp_path / "a.tif", 300, 200, "-alpha", "set", "-channel", "A", "-evaluate", "set", "50%", "+channel")
+    assert run(str(tmp_path), "-f", "jp2") == 0
+    with Image.open(tmp_path / "access" / "a.jp2") as im:
+        assert im.mode == "RGB"
+
+
+@needs_imagemagick
+def test_jp2_rerun_replaces_all_jp2s_and_keeps_jpgs(tmp_path):
+    make_image(tmp_path / "a.tif")
+    access = tmp_path / "access"
+    access.mkdir()
+    for name in ("a.jp2", "removed.JP2", "old.jpf", "keep.jpg", "keep.pdf"):
+        (access / name).write_bytes(b"old")
+
+    assert run(str(tmp_path), "-f", "jp2") == 0
+    assert sorted(p.name for p in access.iterdir()) == ["a.jp2", "keep.jpg", "keep.pdf"]
+    assert (access / "a.jp2").read_bytes() != b"old"
+    assert "Removed 3 JPEG 2000 files from an earlier run" in log_text(tmp_path)
+
+
+@needs_imagemagick
+def test_jp2_name_clash_fails_folder(tmp_path):
+    make_image(tmp_path / "a.tif")
+    make_image(tmp_path / "a.jpg")
+    assert run(str(tmp_path), "-f", "jp2") == 1
+    assert not (tmp_path / "access").exists()
+    assert "These images would get the same JPEG 2000 name: a.jpg and a.tif" in log_text(tmp_path)
+
+
+@needs_imagemagick
+def test_missing_jp2_writer_stops_before_converting(tmp_path, monkeypatch):
+    monkeypatch.setattr(ci, "pillow_writes_jp2", lambda: False)
+    make_image(tmp_path / "a.tif")
+    with pytest.raises(RuntimeError, match="JPEG 2000"):
+        run(str(tmp_path), "-f", "jpg,jp2")
+    assert not (tmp_path / "access").exists()
+    assert "Pillow can't write JPEG 2000 files" in log_text(tmp_path)
 
 
 # --- Failures ---
@@ -371,7 +511,7 @@ def test_corrupt_image_fails_folder_keeps_work_and_continues(tmp_path):
     (bad / "b.tif").write_bytes(b"not an image")
     make_image(good / "a.tif")
 
-    assert run("pdf", str(tmp_path), "--no-ocr") == 1
+    assert run(str(tmp_path), "-f", "pdf", "--no-ocr") == 1
     assert (bad / "_work").exists()  # Unexpected failure: kept for debugging
     assert not (bad / "access").exists()
     assert (good / "access" / "good.pdf").exists()
@@ -388,7 +528,7 @@ def test_shared_output_folder_fails_both_folders_and_keeps_outputs(tmp_path):
     access.mkdir()
     (access / "b01-part01.pdf").write_bytes(b"old")  # From an earlier run; must not be removed
 
-    assert run("pdf", str(tmp_path), "--no-ocr") == 1
+    assert run(str(tmp_path), "-f", "pdf", "--no-ocr") == 1
     assert [p.name for p in access.iterdir()] == ["b01-part01.pdf"]
     assert not (parent / "_work").exists() and not (parent / "master" / "_work").exists()
     assert (tmp_path / "other" / "access" / "other.pdf").exists()
@@ -406,7 +546,7 @@ def test_pdf_rerun_replaces_all_pdfs_and_keeps_jpgs(tmp_path):
     for name in (f"{tmp_path.name}-part01.pdf", f"{tmp_path.name}-part02.pdf", "unrelated.PDF", "old.jpg"):
         (access / name).write_bytes(b"old")  # From an earlier run
 
-    assert run("pdf", str(tmp_path), "--no-ocr") == 0
+    assert run(str(tmp_path), "-f", "pdf", "--no-ocr") == 0
     assert sorted(p.name for p in access.iterdir()) == ["old.jpg", f"{tmp_path.name}.pdf"]
     assert len(page_info(access / f"{tmp_path.name}.pdf")) == 1
     assert "Removed 3 PDFs from an earlier run" in log_text(tmp_path)
@@ -420,7 +560,7 @@ def test_jpg_rerun_replaces_all_jpgs_and_keeps_pdfs(tmp_path):
     for name in ("a.jpg", "removed.JPG", "old.jpeg", "keep.pdf", "sub/keep.jpg"):
         (access / name).write_bytes(b"old")
 
-    assert run("jpg", str(tmp_path)) == 0
+    assert run(str(tmp_path), "-f", "jpg") == 0
     assert sorted(p.name for p in access.iterdir()) == ["a.jpg", "keep.pdf", "sub"]
     assert (access / "a.jpg").read_bytes() != b"old"
     assert (access / "sub" / "keep.jpg").exists()
@@ -438,7 +578,7 @@ def test_locked_output_fails_folder_before_converting(tmp_path):
         (access / name).write_bytes(b"old")
     (access / "old.jpg").chmod(0o444)  # Like a file open in a Windows program: opening for writing fails
 
-    assert run("jpg", str(tmp_path)) == 1
+    assert run(str(tmp_path), "-f", "jpg") == 1
     assert sorted(p.name for p in access.iterdir()) == ["a.jpg", "old.jpg"]
     assert (access / "a.jpg").read_bytes() == b"old"
     log = log_text(tmp_path)
@@ -463,7 +603,7 @@ def test_output_locked_during_run_fails_folder_and_keeps_access(tmp_path, monkey
         return result
 
     monkeypatch.setattr(ci, "convert_all_images", convert_then_lock)
-    assert run("jpg", str(tmp_path)) == 1
+    assert run(str(tmp_path), "-f", "jpg") == 1
     assert [p.name for p in access.iterdir()] == ["old.jpg"]
     assert not (tmp_path / "_work").exists()  # FolderError: an expected problem, so _work is deleted
     assert "Can't replace old.jpg" in log_text(tmp_path)
@@ -480,7 +620,7 @@ def test_name_clash_fails_folder_and_keeps_access(tmp_path):
     (tmp_path / "_work").mkdir()  # Left by an earlier failed run
     (tmp_path / "_work" / "old.pdf").write_bytes(b"old")
 
-    assert run("pdf", str(tmp_path), "--jpg", "--no-ocr") == 1
+    assert run(str(tmp_path), "-f", "pdf,jpg", "--no-ocr") == 1
     assert not (tmp_path / "_work").exists()  # FolderError: an expected problem, so _work is deleted
     assert sorted(p.name for p in pdf_dir.iterdir()) == sorted(
         [f"{tmp_path.name}-part01.pdf", f"{tmp_path.name}.pdf", "unrelated.pdf"])

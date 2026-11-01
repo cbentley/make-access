@@ -85,13 +85,22 @@ def test_output_dir_clashes():
     }
 
 
-def test_check_jpg_name_clashes_is_case_insensitive():
-    with pytest.raises(ci.FolderError, match="a.tif and A.jpg"):
-        ci.check_jpg_name_clashes([Path("a.tif"), Path("A.jpg"), Path("b.tif")])
+def test_check_name_clashes_is_case_insensitive():
+    with pytest.raises(ci.FolderError, match="same JPEG 2000 name: a.tif and A.jpg"):
+        ci.check_name_clashes([Path("a.tif"), Path("A.jpg"), Path("b.tif")], "JPEG 2000")
 
 
-def test_check_jpg_name_clashes_accepts_distinct_names():
-    ci.check_jpg_name_clashes([Path("a.tif"), Path("b.jpg")])
+def test_check_name_clashes_accepts_distinct_names():
+    ci.check_name_clashes([Path("a.tif"), Path("b.jpg")], "JPEG")
+
+
+@pytest.mark.parametrize("items, joined", [
+    (["a"], "a"),
+    (["a", "b"], "a and b"),
+    (["a", "b", "c"], "a, b and c"),
+])
+def test_join_and(items, joined):
+    assert ci.join_and(items) == joined
 
 
 # --- Image conversion helpers ---
@@ -133,43 +142,118 @@ def test_strip_mismatched_icc_keeps_matching_or_missing_profile(icc):
     assert ci.strip_mismatched_icc(jpeg) is jpeg
 
 
+def jp2_bytes(mode: str = "RGB") -> bytes:
+    out = io.BytesIO()
+    Image.new(mode, (16, 16)).save(out, "JPEG2000")
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("dpi", [(300, 300), (118.11 * 2.54, 118.11 * 2.54), (400, 150), (72, 72), (4800, 2400),
+                                 (1.5, 0.1)])
+def test_set_jp2_resolution_is_read_back(dpi):
+    jp2 = jp2_bytes()
+    with_dpi = ci.set_jp2_resolution(jp2, *dpi)
+    with Image.open(io.BytesIO(with_dpi)) as im:
+        assert im.info["dpi"] == pytest.approx(dpi, rel=1e-4)
+    # Only the header changes: the image data is the same
+    with Image.open(io.BytesIO(jp2)) as before, Image.open(io.BytesIO(with_dpi)) as after:
+        assert before.tobytes() == after.tobytes()
+
+
+def test_set_jp2_resolution_replaces_existing_resolution():
+    jp2 = ci.set_jp2_resolution(ci.set_jp2_resolution(jp2_bytes("L"), 300, 300), 600, 200)
+    assert jp2.count(b"res ") == 1
+    with Image.open(io.BytesIO(jp2)) as im:
+        assert im.info["dpi"] == pytest.approx((600, 200), rel=1e-4)
+        assert im.mode == "L"
+
+
+def test_set_jp2_resolution_rejects_codestream_without_jp2_header():
+    out = io.BytesIO()
+    Image.new("RGB", (16, 16)).save(out, "JPEG2000", no_jp2=True)  # Bare codestream (.j2k), no boxes
+    with pytest.raises(ValueError):
+        ci.set_jp2_resolution(out.getvalue(), 300, 300)
+
+
+@pytest.mark.parametrize("dpi", [72, 300, 485, 600, 4800, 100_000])
+def test_jp2_resolution_fields_fit_and_are_accurate(dpi):
+    num, den, exp = ci.jp2_resolution_fields(dpi)
+    assert 0 < num <= 65535 and 0 < den <= 65535 and 0 <= exp <= 255
+    assert num / den * 10 ** exp * 0.0254 == pytest.approx(dpi, rel=1e-4)
+
+
+def test_pillow_writes_jp2():
+    assert ci.pillow_writes_jp2()
+
+
+@pytest.mark.parametrize("mode, quality, expected", [
+    ("RGB", 50, {"mct": 1, "irreversible": True, "quality_mode": "dB", "quality_layers": [50]}),
+    ("L", 47.5, {"mct": 0, "irreversible": True, "quality_mode": "dB", "quality_layers": [47.5]}),
+    ("RGB", None, {"mct": 1, "irreversible": False}),
+])
+def test_jp2_save_options(mode, quality, expected):
+    assert ci.jp2_save_options(mode, quality, {"plt": True}) == {"plt": True, **expected}
+
+
 # --- Command line ---
 
 def test_parse_args_pdf_defaults(tmp_path):
-    args = ci.parse_args(["pdf", str(tmp_path)])
-    assert (args.make_pdf, args.make_jpg) == (True, False)
-    assert args.max_mb == 100
+    args = ci.parse_args([str(tmp_path), "-f", "pdf"])
+    assert (args.make_pdf, args.make_jpg, args.make_jp2) == (True, False, False)
+    assert args.max_mb == ci.DEFAULT_MAX_MB
     assert args.ocr_lang == ci.DEFAULT_OCR_LANG
     assert args.no_ocr is False
 
 
 def test_parse_args_pdf_options(tmp_path):
-    args = ci.parse_args(["pdf", str(tmp_path), "--max-mb", "5", "--ocr-lang", "eng", "--jpg"])
-    assert (args.make_pdf, args.make_jpg, args.max_mb, args.ocr_lang) == (True, True, 5, "eng")
+    args = ci.parse_args([str(tmp_path), "-f", "pdf,jpg,jp2", "--max-mb", "5", "--ocr-lang", "eng"])
+    assert (args.make_pdf, args.make_jpg, args.make_jp2, args.max_mb, args.ocr_lang) == (True, True, True, 5, "eng")
+    assert args.folder == str(tmp_path)
 
 
 def test_parse_args_no_ocr_leaves_language_unset(tmp_path):
-    assert ci.parse_args(["pdf", str(tmp_path), "--no-ocr"]).ocr_lang is None
-    assert ci.parse_args(["pdf", str(tmp_path), "--no-ocr", "--ocr-lang", "fra"]).ocr_lang == "fra"
+    assert ci.parse_args([str(tmp_path), "-f", "pdf", "--no-ocr"]).ocr_lang is None
+    assert ci.parse_args([str(tmp_path), "-f", "pdf", "--no-ocr", "--ocr-lang", "fra"]).ocr_lang == "fra"
 
 
-def test_parse_args_jpg(tmp_path):
-    args = ci.parse_args(["jpg", str(tmp_path)])
-    assert (args.make_pdf, args.make_jpg) == (False, True)
-
-
-@pytest.mark.parametrize("argv", [
-    ["pdf", "/does/not/exist"],
-    ["pdf", ".", "--max-mb", "big"],
-    ["jpg", ".", "--max-mb", "5"],
-    ["jpeg", "."],
-    ["pdf", ".", "--jpeg"],
-    [],
+@pytest.mark.parametrize("formats, made", [
+    (["-f", "jpg"], (False, True, False)),
+    (["-f", "jpeg"], (False, True, False)),
+    (["-f", "JPG,Jp2"], (False, True, True)),
+    (["-f", "jp2"], (False, False, True)),
+    (["-f", "jp2,jpeg,jpg"], (False, True, True)),
+    (["-f", "pdf, jpg"], (True, True, False)),
+    (["-f", "jpg,"], (False, True, False)),
+    (["-f", "jpg", "-f", "pdf"], (True, True, False)),
+    (["--format", "pdf,jp2"], (True, False, True)),
+    (["--format=pdf,jp2"], (True, False, True)),
 ])
-def test_parse_args_errors_exit_with_code_2(argv):
+def test_parse_args_formats(tmp_path, formats, made):
+    # The folder works both before and after -f
+    for argv in ([str(tmp_path), *formats], [*formats, str(tmp_path)]):
+        args = ci.parse_args(argv)
+        assert (args.make_pdf, args.make_jpg, args.make_jp2) == made, argv
+        assert args.folder == str(tmp_path), argv
+
+
+@pytest.mark.parametrize("argv, message", [
+    (["/does/not/exist", "-f", "pdf"], "folder not found"),
+    ([".", "-f", "pdf", "--max-mb", "big"], "invalid int"),
+    ([".", "-f", "jpg", "--max-mb", "5"], "--max-mb only applies with -f pdf"),
+    ([".", "-f", "jp2", "--no-ocr", "--ocr-lang", "eng"], "--ocr-lang and --no-ocr only apply with -f pdf"),
+    ([".", "-f", "pdf,png"], "unknown format: png (choose from pdf, jpg, jp2)"),
+    ([".", "-f", ","], "no format given"),
+    ([".", "-f", "pdf", "jpg"], "unrecognized arguments: jpg"),  # Formats need commas
+    (["-f", "pdf"], "required: folder"),
+    (["."], "required: -f"),
+    (["pdf", "."], "required: -f"),  # The old subcommand syntax
+    ([], "required: folder, -f"),
+])
+def test_parse_args_errors_exit_with_code_2(capsys, argv, message):
     with pytest.raises(SystemExit) as exc:
         ci.parse_args(argv)
     assert exc.value.code == 2
+    assert message in capsys.readouterr().err
 
 
 # --- Output files ---
@@ -186,15 +270,17 @@ def test_move_outputs_replaces_same_name_and_keeps_others(tmp_path):
     assert not (work / "a.pdf").exists()
 
 
-@pytest.mark.parametrize("make_pdf, make_jpg, expected", [
-    (True, False, ["a.pdf", "b.PDF"]),
-    (False, True, ["c.jpg", "d.JPEG"]),
-    (True, True, ["a.pdf", "b.PDF", "c.jpg", "d.JPEG"]),
+@pytest.mark.parametrize("make_pdf, make_jpg, make_jp2, expected", [
+    (True, False, False, ["a.pdf", "b.PDF"]),
+    (False, True, False, ["c.jpg", "d.JPEG"]),
+    (False, False, True, ["i.jp2", "j.JPF"]),
+    (True, True, False, ["a.pdf", "b.PDF", "c.jpg", "d.JPEG"]),
+    (True, True, True, ["a.pdf", "b.PDF", "c.jpg", "d.JPEG", "i.jp2", "j.JPF"]),
 ])
-def test_old_outputs_selects_by_command(tmp_path, make_pdf, make_jpg, expected):
-    touch(tmp_path, "a.pdf", "b.PDF", "c.jpg", "d.JPEG", "e.tif", "notes.txt", "g.pdf.bak")
-    touch(tmp_path / "sub", "f.pdf", "h.jpg")  # Subfolders are left alone
-    args = argparse.Namespace(make_pdf=make_pdf, make_jpg=make_jpg)
+def test_old_outputs_selects_by_command(tmp_path, make_pdf, make_jpg, make_jp2, expected):
+    touch(tmp_path, "a.pdf", "b.PDF", "c.jpg", "d.JPEG", "e.tif", "i.jp2", "j.JPF", "notes.txt", "g.pdf.bak")
+    touch(tmp_path / "sub", "f.pdf", "h.jpg", "k.jp2")  # Subfolders are left alone
+    args = argparse.Namespace(make_pdf=make_pdf, make_jpg=make_jpg, make_jp2=make_jp2)
     assert [p.name for p in ci.old_outputs(tmp_path, ci.output_suffixes(args))] == expected
 
 
@@ -217,6 +303,8 @@ def test_check_not_locked_names_files_that_cant_be_written(tmp_path):
     (["a.pdf", "b.PDF", "c.jpg"], "Removed 2 PDFs and 1 JPEG from an earlier run"),
     (["a.jpg", "b.jpeg"], "Removed 2 JPEGs from an earlier run"),
     (["a.pdf"], "Removed 1 PDF from an earlier run"),
+    (["a.jp2", "b.pdf", "c.jpg"], "Removed 1 PDF, 1 JPEG and 1 JPEG 2000 file from an earlier run"),
+    (["a.jp2", "b.JPF"], "Removed 2 JPEG 2000 files from an earlier run"),
 ])
 def test_remove_old_outputs_logs_counts(tmp_path, caplog, names, message):
     touch(tmp_path, *names, "keep.pdf")

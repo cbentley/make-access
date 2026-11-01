@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Convert folders of images into OCR-processed, size-limited PDFs and/or JPEGs.
+Convert folders of images into OCR-processed, size-limited PDFs, JPEGs and/or JPEG 2000 files.
 
 Usage:
-    python convert_images.py pdf [options] <folder>
-    python convert_images.py jpg <folder>
+    python convert_images.py <folder> -f pdf,jpg,jp2 [options]   (one or more of pdf, jpg, jp2)
 
 See README.md for full documentation.
 """
@@ -17,16 +16,19 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import nullcontext
+from fractions import Fraction
 from pathlib import Path
 from typing import NamedTuple
 
 import img2pdf
 import pikepdf
-from PIL import Image
+from PIL import Image, features
 
 
 # ============================================================
@@ -40,10 +42,10 @@ EXCLUDED_WORDS = {"ruler"}
 # Folder names that are too generic to name the output; use the parent's name instead, and put the output folder
 # next to the image folder rather than inside it. Lowercase.
 GENERIC_FOLDER_NAMES = {"master"}
-# Output folder for the PDFs and JPEGs. Folders with this name are never searched for images.
+# Output folder for the PDFs, JPEGs and JPEG 2000 files. Folders with this name are never searched for images.
 ACCESS_DIR_NAME = "access"
 
-# --- ImageMagick (encodes each image as a JPEG; for PDFs, img2pdf wraps it into a page without re-encoding) ---
+# --- ImageMagick (encodes each image as a JPEG or JPEG 2000; for PDFs, img2pdf wraps the JPEG into a page) ---
 # "magick" on ImageMagick 7 (where "convert" is deprecated), "convert" on ImageMagick 6
 IMAGEMAGICK_CMD = "magick" if shutil.which("magick") else "convert"
 # Read settings, placed before the input file.
@@ -72,6 +74,14 @@ PDF_MAX_SIZE = 2500
 PDF_QUALITY = 75
 JPG_MAX_SIZE = 2500
 JPG_QUALITY = 85
+# JP2_QUALITY: target PSNR in dB (higher = closer to the original and larger files), or None for lossless.
+# Not the same scale as JPEG quality. Lossy files use the irreversible 9/7 wavelet, lossless ones the 5/3.
+JP2_MAX_SIZE = None
+JP2_QUALITY = 50
+# Further Pillow options for writing JPEG 2000 files (see Pillow's JPEG 2000 docs, e.g. tile_size, num_resolutions).
+# RPCL orders the data by resolution first, so viewers can show a smaller version without reading the whole file
+# (like a progressive JPEG). PLT markers index the data, so image servers can find a region without decoding it all.
+JP2_OPTS = {"progression": "RPCL", "plt": True}
 
 # --- OCRmyPDF ---
 OCR_CMD = "ocrmypdf"
@@ -121,8 +131,14 @@ def setup_logging(input_folder: Path) -> Path:
 # VALIDATION
 # ============================================================
 
-def validate_external_tools(need_ocrmypdf: bool) -> None:
-    """Verify ImageMagick, the sRGB profile and, for PDFs, OCRmyPDF are available (it runs even with --no-ocr)."""
+def pillow_writes_jp2() -> bool:
+    """True if Pillow was built with OpenJPEG, which it needs for JPEG 2000 (PyPI's wheels include it)."""
+    return features.check_codec("jpg_2000")
+
+
+def validate_external_tools(need_ocrmypdf: bool, need_jp2: bool = False) -> None:
+    """Verify ImageMagick, the sRGB profile and, for PDFs, OCRmyPDF are available (it runs even with --no-ocr),
+    and that Pillow can write JPEG 2000 if it's needed."""
     tools = {f"ImageMagick ({IMAGEMAGICK_CMD})": [IMAGEMAGICK_CMD, "--version"]}
     if need_ocrmypdf:
         tools["OCRmyPDF"] = [OCR_CMD, "--version"]
@@ -139,6 +155,10 @@ def validate_external_tools(need_ocrmypdf: bool) -> None:
         except Exception:
             logger.error(f"{name} is missing or not working. Check installation.")
             raise
+
+    if need_jp2 and not pillow_writes_jp2():
+        logger.error("Pillow can't write JPEG 2000 files (it needs OpenJPEG support). Check installation.")
+        raise RuntimeError("Pillow has no JPEG 2000 writer")
 
     if not Path(SRGB_PROFILE).is_file():
         logger.error(f"sRGB profile not found: {SRGB_PROFILE}. Check SRGB_PROFILE.")
@@ -193,21 +213,33 @@ def jpg_name(image: Path) -> str:
     return f"{image.stem}.jpg"
 
 
-def check_jpg_name_clashes(images: list[Path]) -> None:
-    """Raise if two images would get the same JPEG name (e.g. a.tif and a.jpg), instead of one overwriting the other.
-    Compared case-insensitively, since Windows folders (/mnt/c in WSL) don't distinguish case."""
+def jp2_name(image: Path) -> str:
+    """Output filename of an image's JPEG 2000 file."""
+    return f"{image.stem}.jp2"
+
+
+def check_name_clashes(images: list[Path], kinds: str) -> None:
+    """Raise if two images would get the same output name (e.g. a.tif and a.jpg both make a.jpg and a.jp2), instead
+    of one overwriting the other. kinds names the outputs in the message, e.g. "JPEG". JPEG and JPEG 2000 names both
+    come from the image's stem, so one check covers both. Compared case-insensitively, since Windows folders
+    (/mnt/c in WSL) don't distinguish case."""
     by_name: dict[str, list[str]] = {}
     for image in images:
-        by_name.setdefault(jpg_name(image).lower(), []).append(image.name)
+        by_name.setdefault(image.stem.lower(), []).append(image.name)
     clashes = [names for names in by_name.values() if len(names) > 1]
     if clashes:
         raise FolderError(
-            "These images would get the same JPEG name: " + "; ".join(" and ".join(names) for names in clashes)
+            f"These images would get the same {kinds} name: " + "; ".join(" and ".join(names) for names in clashes)
         )
 
 
+def join_and(items: list[str]) -> str:
+    """Join items for a message: "a", "a and b", "a, b and c"."""
+    return " and ".join(filter(None, [", ".join(items[:-1]), items[-1]]))
+
+
 # ============================================================
-# IMAGE CONVERSION (JPEG, and single-page PDF)
+# IMAGE CONVERSION (JPEG, JPEG 2000, and single-page PDF)
 # ============================================================
 
 # ICC profile color space (header bytes 16-20) expected for each JPEG mode
@@ -273,19 +305,20 @@ def strip_mismatched_icc(jpeg: bytes) -> bytes:
     return bytes(out)
 
 
-def encode_jpeg(image_path: Path, info: ImageInfo, jpeg_path: Path, max_size: int | None, quality: int,
-                standalone: bool) -> None:
-    """Encode the first image of a file as an upright sRGB JPEG, scaled down so neither side exceeds max_size
-    (if set). info must come from read_image_info, so it describes the image after -auto-orient.
-    Standalone JPEGs (not PDF pages) are progressive, for faster display on the web, and their DPI is scaled
-    along with the pixels, so they keep the original's real size; images without a stored DPI are left without one.
+def resize_scale(info: ImageInfo, max_size: int | None) -> float:
+    """Factor an image is scaled by so neither side exceeds max_size (1 if it already fits or max_size is None)."""
+    if max_size and max(info.width, info.height) > max_size:
+        return max_size / max(info.width, info.height)
+    return 1.0
+
+
+def imagemagick_read_opts(image_path: Path, max_size: int | None, scale: float) -> list[str]:
+    """ImageMagick command up to the output settings: read the first image of a file, make it upright, convert it
+    to sRGB, remove metadata, and scale it down by scale (from resize_scale) to fit max_size.
     Comments and all profiles except the sRGB one are removed (e.g. EXIF, XMP and Photoshop data, which ImageMagick
     copies from the original): they make every file larger and nothing here uses them. The orientation tag is
     applied first (-auto-orient), so the image stays upright without it."""
-    scale = 1.0
-    if max_size and max(info.width, info.height) > max_size:
-        scale = max_size / max(info.width, info.height)
-    cmd = [
+    return [
         IMAGEMAGICK_CMD,
         *IMAGEMAGICK_INPUT_OPTS,
         f"{image_path}[0]",  # First image only (multi-page TIFFs, Photoshop layers)
@@ -293,6 +326,19 @@ def encode_jpeg(image_path: Path, info: ImageInfo, jpeg_path: Path, max_size: in
         "-profile", SRGB_PROFILE,  # Before -resize, so pixels are converted before resizing and encoding
         "+profile", "!icc,*", "+set", "comment",  # Remove all profiles except ICC (now sRGB), and comments
         *(["-resize", f"{max_size}x{max_size}>"] if scale < 1 else []),
+    ]
+
+
+def encode_jpeg(image_path: Path, info: ImageInfo, jpeg_path: Path, max_size: int | None, quality: int,
+                standalone: bool) -> None:
+    """Encode the first image of a file as an upright sRGB JPEG, scaled down so neither side exceeds max_size
+    (if set), without metadata (see imagemagick_read_opts). info must come from read_image_info, so it describes
+    the image after -auto-orient.
+    Standalone JPEGs (not PDF pages) are progressive, for faster display on the web, and their DPI is scaled
+    along with the pixels, so they keep the original's real size; images without a stored DPI are left without one."""
+    scale = resize_scale(info, max_size)
+    cmd = [
+        *imagemagick_read_opts(image_path, max_size, scale),
         *(["-units", "PixelsPerInch", "-density", f"{info.x_dpi * scale:.4f}x{info.y_dpi * scale:.4f}"]
           if standalone and info.has_dpi else []),
         *(["-interlace", "JPEG"] if standalone else []),  # Progressive
@@ -306,14 +352,135 @@ def encode_jpeg(image_path: Path, info: ImageInfo, jpeg_path: Path, max_size: in
         jpeg_path.write_bytes(stripped)
 
 
+def jp2_resolution_fields(dpi: float) -> tuple[int, int, int]:
+    """Numerator, denominator and exponent of a JP2 resolution in pixels per metre (num / denom * 10**exp), each
+    within the box's field sizes (16-bit unsigned; the exponent is kept >= 0, since Pillow reads it unsigned)."""
+    exp = 0
+    value = Fraction(dpi) / Fraction("0.0254")
+    while value > 65535:
+        value /= 10
+        exp += 1
+    fraction = value.limit_denominator(65535)
+    while fraction.numerator > 65535:  # A close fraction can have a numerator just over the limit
+        fraction = value.limit_denominator(fraction.denominator - 1)
+    return fraction.numerator, fraction.denominator, exp
+
+
+def jp2_box(box_type: bytes, content: bytes) -> bytes:
+    return (8 + len(content)).to_bytes(4, "big") + box_type + content
+
+
+def set_jp2_resolution(jp2: bytes, x_dpi: float, y_dpi: float) -> bytes:
+    """Return a JP2 file with its DPI set: a resolution box ("res ") with capture and default display resolution
+    ("resc", "resd"), replacing any there is, in the JP2 header box. Pillow's JPEG 2000 writer (OpenJPEG) stores
+    no DPI. Only the header changes; the image data is copied as is."""
+    hx_num, hx_den, hx_exp = jp2_resolution_fields(x_dpi)
+    vy_num, vy_den, vy_exp = jp2_resolution_fields(y_dpi)
+    # Fields: vertical num, denom, horizontal num, denom, vertical exponent, horizontal exponent
+    fields = (vy_num.to_bytes(2, "big") + vy_den.to_bytes(2, "big") + hx_num.to_bytes(2, "big")
+              + hx_den.to_bytes(2, "big") + bytes([vy_exp, hx_exp]))
+    res_box = jp2_box(b"res ", jp2_box(b"resc", fields) + jp2_box(b"resd", fields))
+
+    out = bytearray()
+    i = 0
+    while i < len(jp2):
+        length, box_type = int.from_bytes(jp2[i:i + 4], "big"), jp2[i + 4:i + 8]
+        if box_type != b"jp2h":
+            if length == 0:  # Box runs to the end of the file (the codestream)
+                out += jp2[i:]
+                break
+            if length == 1:  # 64-bit length follows
+                length = int.from_bytes(jp2[i + 8:i + 16], "big")
+            out += jp2[i:i + length]
+            i += length
+            continue
+        if length < 8:
+            raise ValueError("unexpected JP2 header box length")
+        # Copy the header's boxes except an existing resolution box, then add the new one
+        content = bytearray()
+        j, end = i + 8, i + length
+        while j < end:
+            sub_length, sub_type = int.from_bytes(jp2[j:j + 4], "big"), jp2[j + 4:j + 8]
+            if sub_length < 8:
+                raise ValueError("unexpected JP2 header box length")
+            if sub_type != b"res ":
+                content += jp2[j:j + sub_length]
+            j += sub_length
+        out += jp2_box(b"jp2h", bytes(content) + res_box)
+        out += jp2[end:]
+        return bytes(out)
+    raise ValueError("no JP2 header box found")
+
+
+def jp2_save_options(mode: str, quality: float | None, extra_options: dict) -> dict:
+    """Pillow save options for a JPEG 2000 file: extra_options (JP2_OPTS), plus lossy (9/7 wavelet, quality as
+    target PSNR in dB) or, with quality None, lossless (5/3 wavelet). RGB images are converted to a luma/chroma color
+    space for compression (mct; Pillow leaves it off by default, which about doubles the file size)."""
+    options = {**extra_options, "mct": 1 if mode == "RGB" else 0}
+    if quality is None:
+        options["irreversible"] = False
+    else:
+        options.update(irreversible=True, quality_mode="dB", quality_layers=[quality])
+    return options
+
+
+def write_jp2(pnm_path: Path, jp2_path: Path, quality: float | None, extra_options: dict) -> None:
+    """Encode an uncompressed image from ImageMagick as a JPEG 2000 file with Pillow (see jp2_save_options).
+    Runs in a worker process (encode_jp2): Pillow holds Python's global lock while encoding JPEG 2000, so in
+    threads only one image would be encoded at a time. The settings come as arguments, not from the module's
+    constants, which a worker process wouldn't see changed."""
+    with Image.open(pnm_path) as im:
+        # Black-and-white images come as 1-bit, which Pillow can't write as JPEG 2000
+        pixels = im.convert("L") if im.mode == "1" else im
+        pixels.save(jp2_path, "JPEG2000", **jp2_save_options(pixels.mode, quality, extra_options))
+
+
+def ignore_ctrl_c() -> None:
+    """Worker process initializer: leave Ctrl-C to the main process, which stops the run (otherwise every worker
+    prints its own traceback). Running encodes finish first; they take seconds."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def encode_jp2(image_path: Path, info: ImageInfo, jp2_path: Path, max_size: int | None,
+               quality: float | None, pool: Executor) -> None:
+    """Encode the first image of a file as an upright 8-bit sRGB (or gray) JPEG 2000 file, scaled down so neither
+    side exceeds max_size (if set), without metadata (see imagemagick_read_opts). info must come from
+    read_image_info. The DPI is scaled along with the pixels, as for standalone JPEGs; images without a stored DPI
+    are left without one.
+    ImageMagick prepares the pixels and writes them uncompressed (PNM, next to jp2_path; gray if every pixel is
+    gray, as its JPEG writer does), then Pillow encodes them with OpenJPEG, in a process from pool (see write_jp2).
+    Pillow, unlike ImageMagick, can use the 9/7 wavelet for lossy files, which gives files about a third smaller at
+    the same quality.
+    JP2 has no CMYK, so ImageMagick converts untagged CMYK images to RGB (without a profile, so colors are
+    approximate). Alpha channels are dropped, as they are in JPEGs. The color space is stored as the JP2 code for
+    sRGB or gray, not as an ICC profile."""
+    scale = resize_scale(info, max_size)
+    pnm_path = jp2_path.with_suffix(".pnm")
+    cmd = [
+        *imagemagick_read_opts(image_path, max_size, scale),
+        "-alpha", "off",
+        "-depth", "8",  # 16-bit scans would otherwise stay 16-bit
+        f"pnm:{pnm_path}",
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        pool.submit(write_jp2, pnm_path, jp2_path, quality, JP2_OPTS).result()
+    finally:
+        pnm_path.unlink(missing_ok=True)
+    if info.has_dpi:
+        jp2_path.write_bytes(set_jp2_resolution(jp2_path.read_bytes(), info.x_dpi * scale, info.y_dpi * scale))
+
+
 def page_size_points(info: ImageInfo) -> tuple[float, float]:
     """PDF page size in points: the original image's real size (pixels / DPI, FALLBACK_DPI if it has none)."""
     x_dpi, y_dpi = (info.x_dpi, info.y_dpi) if info.has_dpi else (FALLBACK_DPI, FALLBACK_DPI)
     return info.width / x_dpi * 72, info.height / y_dpi * 72
 
 
-def convert_image(image_path: Path, page_pdf: Path | None, jpg_path: Path | None) -> None:
-    """Convert one image into a one-page PDF (page_pdf) and/or a standalone JPEG (jpg_path).
+def convert_image(image_path: Path, page_pdf: Path | None, jpg_path: Path | None, jp2_path: Path | None,
+                  jp2_pool: Executor | None = None) -> None:
+    """Convert one image into a one-page PDF (page_pdf), a standalone JPEG (jpg_path) and/or a JPEG 2000 file
+    (jp2_path, encoded in a process from jp2_pool).
     PDF pages: ImageMagick encodes a JPEG and img2pdf wraps it without re-encoding. (ImageMagick's own PDF writer
     is blocked by the default security policy on Ubuntu 22.04, and adds a thumbnail and, for images with an
     alpha channel, an opaque soft mask to every page.)"""
@@ -336,22 +503,30 @@ def convert_image(image_path: Path, page_pdf: Path | None, jpg_path: Path | None
     if jpg_path:
         encode_jpeg(image_path, info, jpg_path, JPG_MAX_SIZE, JPG_QUALITY, standalone=True)
 
+    if jp2_path:
+        encode_jp2(image_path, info, jp2_path, JP2_MAX_SIZE, JP2_QUALITY, jp2_pool)
 
-def convert_all_images(images: list[Path], single_pages_dir: Path | None, jpg_dir: Path | None) -> list[Path]:
-    """Convert images into single-page PDFs in single_pages_dir and/or JPEGs in jpg_dir (either may be None;
-    both are created). Returns the page PDFs in page order (empty if single_pages_dir is None)."""
-    for d in (single_pages_dir, jpg_dir):
+
+def convert_all_images(images: list[Path], single_pages_dir: Path | None, jpg_dir: Path | None,
+                       jp2_dir: Path | None) -> list[Path]:
+    """Convert images into single-page PDFs in single_pages_dir, JPEGs in jpg_dir and/or JPEG 2000 files in jp2_dir
+    (those that aren't None are created). Returns the page PDFs in page order (empty if single_pages_dir is None)."""
+    for d in (single_pages_dir, jpg_dir, jp2_dir):
         if d:
             d.mkdir(parents=True, exist_ok=True)
     # Zero-padded so the pages also sort correctly by name
     page_pdfs = [single_pages_dir / f"page{idx:06d}.pdf" for idx in range(len(images))] \
         if single_pages_dir else [None] * len(images)
     jpgs = [jpg_dir / jpg_name(img) for img in images] if jpg_dir else [None] * len(images)
+    jp2s = [jp2_dir / jp2_name(img) for img in images] if jp2_dir else [None] * len(images)
 
-    with ThreadPoolExecutor(max_workers=CONVERT_JOBS) as executor:
+    # Processes for Pillow's JPEG 2000 encoding (see write_jp2); the threads wait for them
+    jp2_pool_context = (ProcessPoolExecutor(max_workers=CONVERT_JOBS, initializer=ignore_ctrl_c) if jp2_dir
+                        else nullcontext())
+    with jp2_pool_context as jp2_pool, ThreadPoolExecutor(max_workers=CONVERT_JOBS) as executor:
         futures = [
-            executor.submit(convert_image, img, page_pdf, jpg_path)
-            for img, page_pdf, jpg_path in zip(images, page_pdfs, jpgs)
+            executor.submit(convert_image, img, page_pdf, jpg_path, jp2_path, jp2_pool)
+            for img, page_pdf, jpg_path, jp2_path in zip(images, page_pdfs, jpgs, jp2s)
         ]
         try:
             for future in futures:
@@ -361,8 +536,9 @@ def convert_all_images(images: list[Path], single_pages_dir: Path | None, jpg_di
             executor.shutdown(cancel_futures=True)
             raise
 
-    outputs = [name for name, wanted in (("PDF pages", single_pages_dir), ("JPEGs", jpg_dir)) if wanted]
-    logger.info(f"  Converted {len(images)} images to {' and '.join(outputs)}")
+    outputs = [name for name, wanted in (("PDF pages", single_pages_dir), ("JPEGs", jpg_dir),
+                                         ("JPEG 2000 files", jp2_dir)) if wanted]
+    logger.info(f"  Converted {len(images)} images to {join_and(outputs)}")
     return page_pdfs if single_pages_dir else []
 
 
@@ -530,66 +706,81 @@ def split_pdf_by_size(input_pdf: Path, output_dir: Path, max_mb: int) -> list[Pa
 # COMMAND LINE
 # ============================================================
 
-def parse_args(argv=None) -> argparse.Namespace:
-    """Parse the command line. Sets make_pdf and make_jpg for either subcommand; exits if the folder doesn't exist."""
-    parser = argparse.ArgumentParser(
-        description="Convert folders of scanned images to OCR'd PDFs and/or JPEGs.",
-        epilog="""Run "%(prog)s pdf -h" to see its options.
+# Values of -f, and other spellings accepted for them
+FORMATS = ["pdf", "jpg", "jp2"]
+FORMAT_ALIASES = {"jpeg": "jpg"}
+DEFAULT_MAX_MB = 100
 
-examples:
-  %(prog)s pdf --jpg .
-  %(prog)s pdf /scans
-  %(prog)s pdf --jpg --max-mb 50 --ocr-lang eng /scans
-  %(prog)s jpg /scans""",
+
+def parse_formats(value: str) -> list[str]:
+    """argparse type for -f: a comma-separated list of formats (spaces and case ignored, aliases resolved)."""
+    names = [name.strip().lower() for name in value.split(",") if name.strip()]
+    unknown = [name for name in names if FORMAT_ALIASES.get(name, name) not in FORMATS]
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown format: {', '.join(unknown)} (choose from {', '.join(FORMATS)})")
+    if not names:
+        raise argparse.ArgumentTypeError(f"no format given (choose from {', '.join(FORMATS)})")
+    return [FORMAT_ALIASES.get(name, name) for name in names]
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    """Parse the command line. Sets make_pdf, make_jpg and make_jp2 from -f; exits (code 2) on an unknown format,
+    a PDF option without -f pdf, or a folder that doesn't exist."""
+    generic_names = " or ".join(sorted(GENERIC_FOLDER_NAMES))
+    parser = argparse.ArgumentParser(
+        description="Convert folders of scanned images to OCR'd PDFs, JPEGs and/or JPEG 2000 files.\n"
+                    "Every image folder gets its outputs in an access folder inside it (next to it for a\n"
+                    f"folder named {generic_names}): one PDF per folder, one JPEG or JPEG 2000 file per image.",
+        epilog="""examples:
+  %(prog)s . -f pdf,jpg
+  %(prog)s /scans -f pdf
+  %(prog)s /scans -f pdf,jpg,jp2 --max-mb 50 --ocr-lang eng
+  %(prog)s -f jp2 /scans""",
         formatter_class=argparse.RawDescriptionHelpFormatter,  # Keep the epilog's line breaks
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    generic_names = " or ".join(sorted(GENERIC_FOLDER_NAMES))
-    folder_help = ("Folder with the scans. Subfolders are searched too, "
-                   "and each folder with images is converted on its own.")
-
-    pdf_parser = subparsers.add_parser(
-        "pdf",
-        help="Make an OCR'd PDF per image folder, in its access folder",
-        description="Make an OCR'd, size-limited PDF per image folder, written to an access folder inside it "
-                    f"(next to it for a folder named {generic_names}).",
+    parser.add_argument(
+        "folder",
+        help="Folder with the scans. Subfolders are searched too, and each folder with images is converted on its own."
     )
-    pdf_parser.add_argument("folder", help=folder_help)
-    pdf_parser.add_argument(
+    parser.add_argument(
+        "-f", "--format",
+        dest="formats",
+        type=parse_formats,
+        action="extend",  # -f pdf -f jpg is the same as -f pdf,jpg
+        required=True,
+        metavar="FORMATS",
+        help="What to make, separated by commas: pdf (an OCR'd, size-limited PDF per image folder), jpg (a JPEG "
+             "per image; jpeg also works), jp2 (a JPEG 2000 file per image). Example: -f pdf,jpg"
+    )
+    pdf_options = parser.add_argument_group("PDF options (only with -f pdf)")
+    pdf_options.add_argument(
         "--max-mb",
         type=int,
-        default=100,
-        help="Maximum size in MB for each final PDF before splitting. Default: %(default)s"
+        help=f"Maximum size in MB for each final PDF before splitting. Default: {DEFAULT_MAX_MB}"
     )
-    pdf_parser.add_argument(
+    pdf_options.add_argument(
         "--ocr-lang",
         help=f'Languages to use for OCR. Examples: "eng", "deu", "deu+eng". Default: {DEFAULT_OCR_LANG}'
     )
-    pdf_parser.add_argument(
+    pdf_options.add_argument(
         "--no-ocr",
         action="store_true",
         help="Skip text recognition. OCRmyPDF still runs, so OCR_OPTS such as --optimize still apply."
     )
-    pdf_parser.add_argument(
-        "--jpg",
-        dest="make_jpg",
-        action="store_true",
-        help="Also save each image as a JPEG, in the same access folder."
-    )
-    pdf_parser.set_defaults(make_pdf=True)
-
-    jpg_parser = subparsers.add_parser(
-        "jpg",
-        help="Save each image as a JPEG, in its folder's access folder",
-        description="Save each image as a JPEG, written to an access folder inside its image folder "
-                    f"(next to it for a folder named {generic_names}).",
-    )
-    jpg_parser.add_argument("folder", help=folder_help)
-    jpg_parser.set_defaults(make_pdf=False, make_jpg=True)
 
     args = parser.parse_args(argv)
+    args.make_pdf, args.make_jpg, args.make_jp2 = (name in args.formats for name in FORMATS)
+
+    given_pdf_options = [option for option, given in (("--max-mb", args.max_mb is not None),
+                                                      ("--ocr-lang", args.ocr_lang is not None),
+                                                      ("--no-ocr", args.no_ocr)) if given]
+    if given_pdf_options and not args.make_pdf:
+        verb = "applies" if len(given_pdf_options) == 1 else "apply"
+        parser.error(f"{' and '.join(given_pdf_options)} only {verb} with -f pdf")
     if not Path(args.folder).is_dir():
         parser.error(f"folder not found: {args.folder}")
+    if args.max_mb is None:
+        args.max_mb = DEFAULT_MAX_MB
     # Left as None with --no-ocr, so main() can tell if a given --ocr-lang is ignored
     if args.make_pdf and not args.no_ocr and args.ocr_lang is None:
         args.ocr_lang = DEFAULT_OCR_LANG
@@ -610,7 +801,7 @@ def output_base_name(folder: Path) -> str:
 
 
 def output_dir(folder: Path) -> Path:
-    """Return the folder an image folder's PDFs and JPEGs go to: next to a generic folder, else inside it."""
+    """Return the folder an image folder's outputs go to: next to a generic folder, else inside it."""
     return (folder.parent if is_generic_folder(folder) else folder) / ACCESS_DIR_NAME
 
 
@@ -638,11 +829,19 @@ def move_outputs(files: list[Path], dest_dir: Path) -> None:
 
 PDF_SUFFIXES = {".pdf"}
 JPG_SUFFIXES = {".jpg", ".jpeg"}
+JP2_SUFFIXES = {".jp2", ".jpf"}
+# Each kind of old output, as (singular, plural, extensions), for remove_old_outputs's message
+OUTPUT_KINDS = [
+    ("PDF", "PDFs", PDF_SUFFIXES),
+    ("JPEG", "JPEGs", JPG_SUFFIXES),
+    ("JPEG 2000 file", "JPEG 2000 files", JP2_SUFFIXES),
+]
 
 
 def output_suffixes(args: argparse.Namespace) -> set[str]:
-    """Extensions of the files a run replaces in the access folder: PDFs when making PDFs, JPEGs when making JPEGs."""
-    return (PDF_SUFFIXES if args.make_pdf else set()) | (JPG_SUFFIXES if args.make_jpg else set())
+    """Extensions of the files a run replaces in the access folder: those of each kind of output it makes."""
+    return ((PDF_SUFFIXES if args.make_pdf else set()) | (JPG_SUFFIXES if args.make_jpg else set())
+            | (JP2_SUFFIXES if args.make_jp2 else set()))
 
 
 def old_outputs(dest_dir: Path, suffixes: set[str]) -> list[Path]:
@@ -675,13 +874,15 @@ def check_not_locked(files: list[Path]) -> None:
 
 def remove_old_outputs(files: list[Path]) -> None:
     """Delete the outputs of earlier runs, just before the new ones are moved in, and log how many of each kind."""
-    counts = {"PDF": 0, "JPEG": 0}
     for file in files:
         file.unlink()
-        counts["PDF" if file.suffix.lower() in PDF_SUFFIXES else "JPEG"] += 1
-    removed = " and ".join(f"{n} {kind}{'s' if n > 1 else ''}" for kind, n in counts.items() if n)
+    removed = []
+    for singular, plural, suffixes in OUTPUT_KINDS:
+        n = sum(file.suffix.lower() in suffixes for file in files)
+        if n:
+            removed.append(f"{n} {singular if n == 1 else plural}")
     if removed:
-        logger.info(f"  Removed {removed} from an earlier run")
+        logger.info(f"  Removed {join_and(removed)} from an earlier run")
 
 
 # ============================================================
@@ -727,7 +928,7 @@ def make_final_pdfs(page_pdfs: list[Path], work_dir: Path, base_name: str, args:
 
 
 def convert_folder(folder: Path, args: argparse.Namespace) -> None:
-    """Convert one image folder's images into PDFs and/or JPEGs in its access folder. Intermediate files go to folder/_work;
+    """Convert one image folder's images into PDFs, JPEGs and/or JPEG 2000 files in its access folder. Intermediate files go to folder/_work;
     outputs are moved out only after every step succeeded. Raises on failure."""
     images = select_images(folder)
     if not images:
@@ -735,16 +936,19 @@ def convert_folder(folder: Path, args: argparse.Namespace) -> None:
         logger.warning("  No valid images found.")
         return
     logger.info(f"  Found {len(images)} images")
-    if args.make_jpg:
-        check_jpg_name_clashes(images)
+    image_kinds = [kind for kind, wanted in (("JPEG", args.make_jpg), ("JPEG 2000", args.make_jp2)) if wanted]
+    if image_kinds:
+        check_name_clashes(images, join_and(image_kinds))
 
-    # 1. Convert each image into a single-page PDF and/or a JPEG
+    # 1. Convert each image into a single-page PDF, a JPEG and/or a JPEG 2000 file
     work_dir = folder / WORK_DIR_NAME
     jpg_work_dir = work_dir / "jpg"
+    jp2_work_dir = work_dir / "jp2"
     page_pdfs = convert_all_images(
         images,
         work_dir / "01_single_pages" if args.make_pdf else None,
         jpg_work_dir if args.make_jpg else None,
+        jp2_work_dir if args.make_jp2 else None,
     )
 
     # 2-4. Merge, OCR and split
@@ -763,6 +967,9 @@ def convert_folder(folder: Path, args: argparse.Namespace) -> None:
     if args.make_jpg:
         move_outputs(sorted(jpg_work_dir.iterdir()), dest_dir)
         logger.info(f"  {len(images)} JPEGs written to: {dest_dir}")
+    if args.make_jp2:
+        move_outputs(sorted(jp2_work_dir.iterdir()), dest_dir)
+        logger.info(f"  {len(images)} JPEG 2000 files written to: {dest_dir}")
 
 
 def process_folder(folder: Path, args: argparse.Namespace) -> bool:
@@ -810,11 +1017,12 @@ def main(argv=None) -> int:
     input_folder = Path(args.folder).resolve()
 
     log_file = setup_logging(input_folder)
-    outputs = " and ".join(name for name, wanted in (("PDFs", args.make_pdf), ("JPEGs", args.make_jpg)) if wanted)
+    outputs = join_and([name for name, wanted in (("PDFs", args.make_pdf), ("JPEGs", args.make_jpg),
+                                                  ("JPEG 2000 files", args.make_jp2)) if wanted])
     logger.info(f"Converting images to {outputs} in {input_folder}")
     if args.make_pdf and args.no_ocr and args.ocr_lang:
         logger.warning(f"Ignoring --ocr-lang {args.ocr_lang}: no text is recognized with --no-ocr")
-    validate_external_tools(need_ocrmypdf=args.make_pdf)
+    validate_external_tools(need_ocrmypdf=args.make_pdf, need_jp2=args.make_jp2)
 
     folders = list(find_image_folders(input_folder))
     clashes = output_dir_clashes(folders)

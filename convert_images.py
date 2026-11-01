@@ -77,7 +77,7 @@ JPG_QUALITY = 85
 # JP2_QUALITY: target PSNR in dB (higher = closer to the original and larger files), or None for lossless.
 # Not the same scale as JPEG quality. Lossy files use the irreversible 9/7 wavelet, lossless ones the 5/3.
 JP2_MAX_SIZE = None
-JP2_QUALITY = 50
+JP2_QUALITY = 45
 # Further Pillow options for writing JPEG 2000 files (see Pillow's JPEG 2000 docs, e.g. tile_size, num_resolutions).
 # RPCL orders the data by resolution first, so viewers can show a smaller version without reading the whole file
 # (like a progressive JPEG). PLT markers index the data, so image servers can find a region without decoding it all.

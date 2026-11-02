@@ -576,6 +576,10 @@ def ocr_pdf(input_pdf: Path, output_pdf: Path, ocr_lang: str | None) -> None:
     cmd = [
         OCR_CMD,
         *OCR_OPTS,
+        # Never linearize ("fast web view", by default for files over 1 MB): in Rosetta's viewer
+        # (FlowPaper with PDF.js 1.5), pages of a linearized PDF load very slowly until the whole
+        # file has arrived; the same PDF not linearized is fast. Split parts aren't linearized either.
+        "--fast-web-view", "999999",
         *(["--tesseract-timeout", "0"] if no_ocr else ["-l", ocr_lang]),
         str(input_pdf),
         str(output_pdf),

@@ -396,6 +396,18 @@ def test_large_pdf_is_split_under_max_mb(tmp_path):
     assert sum(len(page_info(p)) for p in parts) == 6
 
 
+@needs_ocr
+def test_pdf_is_not_linearized(tmp_path):
+    """OCRmyPDF linearizes files over 1 MB by default, which makes Rosetta's viewer slow."""
+    for i in range(1, 5):
+        make_noise_image(tmp_path / f"noise{i}.tif", 1000)
+    assert run(str(tmp_path), "-f", "pdf", "--no-ocr") == 0
+    pdf_path = tmp_path / "access" / f"{tmp_path.name}.pdf"
+    assert pdf_path.stat().st_size > 1_000_000
+    with pikepdf.open(pdf_path) as pdf:
+        assert not pdf.is_linearized
+
+
 # --- --no-ocr ---
 
 @needs_ocr

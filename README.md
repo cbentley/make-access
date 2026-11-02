@@ -55,6 +55,16 @@ python make_access.py . -f jpg
 python make_access.py -f jp2 /path/to/images
 ```
 
+## Fixing older PDFs for Rosetta
+
+PDFs made before linearization was turned off load slowly in Rosetta's viewer when they are large. `delinearize.py` resaves them without linearization, in place and losslessly (page images and text are unchanged); folders are searched recursively, and PDFs that aren't linearized are left untouched:
+
+```bash
+python delinearize.py /path/to/access-folders [more files or folders ...]
+```
+
+Close the PDFs first if they are open in Acrobat or PDFgear.
+
 ## What it does
 
 The script searches `<folder>` and all its subfolders. Every folder that directly contains images (`.tif`, `.tiff`, `.jpg`, `.jpeg`, `.jp2`, `.jpf`) is converted on its own; images are never combined across folders. Pages are sorted by filename in natural order, like Windows Explorer: numbers by value (`page2` before `page10`), ignoring case.
@@ -81,7 +91,7 @@ Each image folder is processed in its own `_work` directory:
 | ---------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1. Convert       | `_work/01_single_pages`, `_work/jpg`, `_work/jp2` | ImageMagick turns each image into a JPEG and/or JPEG 2000 file. For PDFs, img2pdf wraps the JPEG into a one-page PDF without re-encoding.               |
 | 2. Merge         | `_work/02_pre_ocr`      | PDF only: all pages are merged into one PDF.                                                                                                                                             |
-| 3. OCR           | `_work/03_ocr`          | PDF only: OCRmyPDF adds a searchable text layer. Depending on `OCR_OPTS`, it may also re-compress the page images (see Configuration).                                                  |
+| 3. OCR           | `_work/03_ocr`          | PDF only: OCRmyPDF adds a searchable text layer. Depending on `OCR_OPTS`, it may also re-compress the page images (see Configuration). PDFs are never linearized ("fast web view"): that makes Rosetta's viewer much slower.                                                  |
 | 4. Split         | `_work/04_split`        | PDF only: if the PDF exceeds `--max-mb`, it is split into parts, each holding as many pages as fit.                                                                                      |
 | 5. Finish        |                         | The final PDFs, JPEGs and JPEG 2000 files are moved into the `access` folder and `_work` is deleted.                                                                     |
 

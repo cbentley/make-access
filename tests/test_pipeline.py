@@ -254,6 +254,10 @@ def test_mixed_run_logs_multi_image_file(mixed_run):
     log = log_text(root)
     assert "p6_multi.tif contains 2 images; using only the first" in log
     assert "Skipped 1 excluded image(s): ruler.tif" in log
+    # Repeated in the summary, which says to check them
+    summary = log[log.index("warning(s):"):]
+    assert "p6_multi.tif contains 2 images; using only the first" in summary
+    assert "All folders converted, but check the warnings above." in summary
 
 
 # --- Color conversion ---
@@ -527,7 +531,32 @@ def test_corrupt_image_fails_folder_keeps_work_and_continues(tmp_path):
     assert (bad / "_work").exists()  # Unexpected failure: kept for debugging
     assert not (bad / "access").exists()
     assert (good / "access" / "good.pdf").exists()
-    assert "Finished with 1 failed folder(s)" in log_text(tmp_path)
+    log = log_text(tmp_path)
+    summary = log[log.index("Finished with 1 failed folder(s)"):]
+    assert str(bad) in summary and str(good) not in summary
+    assert "Can't convert b.tif: " in summary  # The reason, with ImageMagick's message
+    assert "ImageMagick error output for b.tif" in log  # Its full output
+
+
+@needs_imagemagick
+def test_no_images_found_fails(tmp_path):
+    make_image(tmp_path / "pngs" / "a.png")
+    (tmp_path / "notes.txt").write_text("not an image")
+    assert run(str(tmp_path), "-f", "jpg") == 1
+    log = log_text(tmp_path)
+    assert f"No images found in {tmp_path} or its subfolders" in log
+    assert f"Skipped {tmp_path / 'pngs'}: its 1 image(s) are in a format that isn't converted: a.png" in log
+
+
+@needs_imagemagick
+def test_unsupported_image_is_named_in_summary(tmp_path):
+    make_image(tmp_path / "a.tif")
+    make_image(tmp_path / "b.png")
+    assert run(str(tmp_path), "-f", "jpg") == 0
+    assert [p.name for p in (tmp_path / "access").iterdir()] == ["a.jpg"]
+    summary = log_text(tmp_path).split("1 warning(s):")[1]
+    assert f"  {tmp_path}\n" in summary
+    assert "Skipped 1 image(s) in a format that isn't converted: b.png" in summary
 
 
 @needs_ocr

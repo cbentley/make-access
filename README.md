@@ -72,6 +72,7 @@ The script searches `<folder>` and all its subfolders. Every folder that directl
 Skipped:
 - folders whose names start with `_`, and folders named `access` (the script's own output folders)
 - images whose filenames contain an excluded word (currently `ruler`, case-insensitive)
+- files of other types; images in other formats (e.g. `.png`, `.bmp`, `.psd`, camera raw) are named in a warning, so a missing page doesn't go unnoticed
 
 All outputs go into an `access` folder inside each image folder. When a folder succeeds, the files of the kinds just made are replaced: PDFs replace every PDF, JPEGs every JPEG (`.jpg`/`.jpeg`) and JPEG 2000 files every `.jp2`/`.jpf` directly in its `access` folder before moving in the new ones (the log says how many of each kind), so files from earlier runs, including ones added by hand, don't linger. Other files and subfolders are left alone. If one of those files can't be replaced, usually because it's open in a program (Acrobat locks open PDFs on Windows drives), the folder fails without changing its `access` folder. This is checked before any folder is converted and again just before replacing. A folder named `master` (case-insensitive) is the exception: its `access` folder goes next to it, and its PDF takes the parent's name (`b01-f01/master/` → `b01-f01/access/b01-f01.pdf`). If the parent folder holds images too, both would write to the same `access` folder, so both folders fail without writing anything.
 - `<foldername>.pdf`, or `<foldername>-part01.pdf`, `-part02.pdf`, … when it exceeds `--max-mb`.
@@ -97,9 +98,11 @@ Each image folder is processed in its own `_work` directory:
 
 ### Errors
 
-If any step fails for a folder, including OCR (there is no non-OCR fallback), that folder gets no new output and the script moves on to the next folder. Its `access` folder is left unchanged. Its `_work` directory is kept for debugging, except when the failure is a problem with the folder's contents that the log explains (such as a JPEG name clash). Failed folders are listed at the end.
+If any step fails for a folder, including OCR (there is no non-OCR fallback), that folder gets no new output and the script moves on to the next folder. Its `access` folder is left unchanged. Its `_work` directory is kept for debugging, except when the failure is a problem with the folder's contents that the log explains (such as a JPEG name clash).
 
-Exit status: `0` if all folders succeeded, `1` if any failed, `2` for invalid options or a folder that doesn't exist.
+The run ends with a summary, on the console and in the log: first any warnings (e.g. a multi-page TIFF of which only the first image was used, or images in a format that isn't converted), grouped by folder; then the failed folders, each with a one-line reason (e.g. `Can't convert b.tif: Cannot read TIFF header.`), or `All folders converted.` (`All folders converted, but check the warnings above.` if there were warnings). If no images are found at all, the run fails with `No images found in <folder> or its subfolders.`
+
+Exit status: `0` if all folders succeeded (even with warnings), `1` if any failed or no images were found, `2` for invalid options or a folder that doesn't exist.
 
 ## Tests
 

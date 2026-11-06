@@ -37,6 +37,9 @@ from PIL import Image, features
 
 # --- Input selection ---
 ALLOWED_EXT = {".tif", ".tiff", ".jpg", ".jpeg", ".jp2", ".jpf"}
+# Other image formats: not converted, but named in a warning, so a page missing from the output doesn't go unnoticed
+OTHER_IMAGE_EXT = {".png", ".bmp", ".gif", ".webp", ".heic", ".heif", ".avif", ".jxl", ".psd", ".psb", ".j2k", ".j2c",
+                   ".jpx", ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf"}
 # Images whose filenames contain any of these words (case-insensitive) are skipped
 EXCLUDED_WORDS = {"ruler"}
 # Folder names that are too generic to name the output; use the parent's name instead, and put the output folder
@@ -102,6 +105,20 @@ logger = logging.getLogger("make_access")
 
 # Inside the input folder; starts with "_" so it's never searched for images
 LOGS_DIR_NAME = "_logs"
+
+
+class WarningCollector(logging.Handler):
+    """Keeps the run's warnings (not errors) for the summary at the end, each with the folder being processed when
+    it was logged (folder; None before the first folder)."""
+
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.folder: Path | None = None
+        self.warnings: list[tuple[Path | None, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno == logging.WARNING:
+            self.warnings.append((self.folder, record.getMessage().strip()))
 
 
 def setup_logging(input_folder: Path) -> Path:
@@ -194,13 +211,32 @@ def natural_sort_key(path: Path) -> tuple:
     return ([int(t) if i % 2 else t.lower() for i, t in enumerate(parts)], path.name)
 
 
+def other_images(names: list[str]) -> list[str]:
+    """The names of images in a format that isn't converted (OTHER_IMAGE_EXT), in natural order."""
+    return sorted((n for n in names if Path(n).suffix.lower() in OTHER_IMAGE_EXT),
+                  key=lambda n: natural_sort_key(Path(n)))
+
+
+def name_list(names: list[str], limit: int = 5) -> str:
+    """Names for a message, at most limit of them: "a, b, c and 7 more"."""
+    if len(names) <= limit:
+        return join_and(names)
+    return f"{', '.join(names[:limit])} and {len(names) - limit} more"
+
+
 def select_images(folder: Path) -> list[Path]:
-    """Return the folder's wanted images in natural order, logging excluded ones."""
-    candidates = [p for p in folder.iterdir() if is_allowed_ext(p)]
+    """Return the folder's wanted images in natural order, logging excluded ones and warning about images in
+    a format that isn't converted."""
+    files = list(folder.iterdir())
+    candidates = [p for p in files if is_allowed_ext(p)]
     images = sorted((p for p in candidates if not is_excluded(p)), key=natural_sort_key)
     skipped = sorted(p.name for p in candidates if is_excluded(p))
     if skipped:
         logger.info(f"  Skipped {len(skipped)} excluded image(s): {', '.join(skipped)}")
+    unsupported = other_images([p.name for p in files if p.is_file()])
+    if unsupported:
+        logger.warning(f"  Skipped {len(unsupported)} image(s) in a format that isn't converted: "
+                       f"{name_list(unsupported)}")
     return images
 
 
@@ -216,6 +252,29 @@ def jpg_name(image: Path) -> str:
 def jp2_name(image: Path) -> str:
     """Output filename of an image's JPEG 2000 file."""
     return f"{image.stem}.jp2"
+
+
+def command_error_output(e: subprocess.CalledProcessError) -> str:
+    """A failed command's error output as text ("" if it wasn't captured)."""
+    stderr = e.stderr or ""
+    return stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr
+
+
+def failure_reason(e: BaseException) -> str:
+    """One line saying why a folder failed, for the summary at the end of the run. For a failed command, its error
+    output's first error line (ImageMagick's says what's wrong with the file) instead of the whole command line."""
+    if isinstance(e, subprocess.CalledProcessError):
+        lines = [line.strip() for line in command_error_output(e).splitlines() if line.strip()]
+        # ImageMagick writes "<program>: <message> `<file>' @ error/<source>" (or "@ warning/", which can come
+        # first); keep only the message, the full output is in the log
+        for line in lines:
+            if match := re.match(r"\S+: (.*?)(?: `[^']*')? @ error/\S+$", line):
+                return match[1]
+        return f"{Path(str(e.cmd[0])).name} failed (exit code {e.returncode})" + (f": {lines[0]}" if lines else "")
+    message = str(e).strip().splitlines()[0] if str(e).strip() else ""
+    if isinstance(e, (FolderError, RuntimeError)) and message:
+        return message
+    return f"{type(e).__name__}: {message}" if message else type(e).__name__
 
 
 def check_name_clashes(images: list[Path], kinds: str) -> None:
@@ -529,8 +588,13 @@ def convert_all_images(images: list[Path], single_pages_dir: Path | None, jpg_di
             for img, page_pdf, jpg_path, jp2_path in zip(images, page_pdfs, jpgs, jp2s)
         ]
         try:
-            for future in futures:
-                future.result()
+            for image, future in zip(images, futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    if isinstance(e, subprocess.CalledProcessError) and command_error_output(e).strip():
+                        logger.error(f"  ImageMagick error output for {image.name}:\n{command_error_output(e)}")
+                    raise RuntimeError(f"Can't convert {image.name}: {failure_reason(e)}") from e
         except BaseException:
             # Don't start queued conversions after a failure or Ctrl-C
             executor.shutdown(cancel_futures=True)
@@ -899,11 +963,16 @@ WORK_DIR_NAME = "_work"
 
 def find_image_folders(input_folder: Path) -> Iterator[Path]:
     """Yield input_folder and every folder below it that directly contains wanted images.
-    Folders starting with "_" (work and log folders) and the output folders are skipped, with their subfolders."""
+    Folders starting with "_" (work and log folders) and the output folders are skipped, with their subfolders.
+    Warns about folders that have only images in a format that isn't converted (select_images warns about the
+    others)."""
     for root, dirs, files in os.walk(input_folder):
         dirs[:] = [d for d in dirs if not d.startswith("_") and not is_output_dir(d)]
         if any(is_wanted_image(Path(f)) for f in files):
             yield Path(root)
+        elif unsupported := other_images(files):
+            logger.warning(f"Skipped {root}: its {len(unsupported)} image(s) are in a format that isn't converted: "
+                           f"{name_list(unsupported)}")
 
 
 def make_final_pdfs(page_pdfs: list[Path], work_dir: Path, base_name: str, args: argparse.Namespace) -> list[Path]:
@@ -976,8 +1045,9 @@ def convert_folder(folder: Path, args: argparse.Namespace) -> None:
         logger.info(f"  {len(images)} JPEG 2000 files written to: {dest_dir}")
 
 
-def process_folder(folder: Path, args: argparse.Namespace) -> bool:
-    """Run convert_folder, log any failure and clean up. Returns True if the folder succeeded.
+def process_folder(folder: Path, args: argparse.Namespace) -> str | None:
+    """Run convert_folder, log any failure and clean up. Returns None if the folder succeeded, else the reason it
+    failed (one line, for the summary).
 
     _work is deleted, except after unexpected failures and Ctrl-C, where it's kept for debugging. A FolderError
     is an expected problem with the folder's contents, logged without a traceback. Ctrl-C stops the whole run."""
@@ -985,6 +1055,7 @@ def process_folder(folder: Path, args: argparse.Namespace) -> bool:
     work_dir = folder / WORK_DIR_NAME
     success = False
     keep_work = False
+    reason = None
     try:
         convert_folder(folder, args)
         success = True
@@ -993,9 +1064,11 @@ def process_folder(folder: Path, args: argparse.Namespace) -> bool:
         logger.error("Interrupted by user (Ctrl-C); leaving _work for debugging.")
         raise
     except FolderError as e:
+        reason = failure_reason(e)
         logger.error(f"Folder failed: {folder}\n  {e}")
-    except Exception:
+    except Exception as e:
         keep_work = True
+        reason = failure_reason(e)
         logger.exception(f"Folder failed: {folder}; leaving _work for debugging.")
     finally:
         if keep_work:
@@ -1008,19 +1081,51 @@ def process_folder(folder: Path, args: argparse.Namespace) -> bool:
             except Exception:
                 logger.exception(f"  Failed to remove work directory: {work_dir}")
 
-    return success
+    return reason
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
+def log_summary(input_folder: Path, folders: list[Path], failed: dict[Path, str],
+                warnings: list[tuple[Path | None, str]]) -> int:
+    """Log the end of the run: the warnings, grouped by folder, then the failed folders with their reasons, or
+    that all folders were converted. Returns the exit code: 1 if a folder failed or no image folder was found."""
+    if warnings:
+        logger.warning(f"\n{len(warnings)} warning(s):")
+        for message in (message for folder, message in warnings if folder is None):
+            logger.warning(f"  {message}")
+        for folder in dict.fromkeys(folder for folder, _ in warnings if folder is not None):
+            logger.warning(f"  {folder}")
+            for message in (message for f, message in warnings if f == folder):
+                logger.warning(f"    {message}")
+
+    if not folders:
+        logger.error(f"\nNo images found in {input_folder} or its subfolders. "
+                     f"Only {join_and(sorted(ALLOWED_EXT))} files are converted.")
+        return 1
+    if failed:
+        logger.error(f"\nFinished with {len(failed)} failed folder(s):")
+        for folder, reason in failed.items():
+            logger.error(f"  {folder}\n    {reason}")
+        return 1
+    if warnings:
+        logger.warning("\nAll folders converted, but check the warnings above.")
+    else:
+        logger.info("\nAll folders converted.")
+    return 0
+
+
 def main(argv=None) -> int:
-    """Convert every image folder under the input folder. Returns the exit code: 0 if all folders succeeded, else 1."""
+    """Convert every image folder under the input folder. Returns the exit code: 0 if all folders succeeded, 1 if
+    a folder failed or no image folder was found."""
     args = parse_args(argv)
     input_folder = Path(args.folder).resolve()
 
     log_file = setup_logging(input_folder)
+    warnings = WarningCollector()
+    logger.addHandler(warnings)
     outputs = join_and([name for name, wanted in (("PDFs", args.make_pdf), ("JPEGs", args.make_jpg),
                                                   ("JPEG 2000 files", args.make_jp2)) if wanted])
     logger.info(f"Converting images to {outputs} in {input_folder}")
@@ -1037,28 +1142,25 @@ def main(argv=None) -> int:
             check_not_locked(old_outputs(output_dir(folder), output_suffixes(args)))
         except FolderError as e:
             locked[folder] = e
-    failed_folders = []
+    failed: dict[Path, str] = {}
     for folder in folders:
+        warnings.folder = folder
         # The first two fail before anything is written or cleaned up, so the access folder is left alone
         if folder in clashes:
             others = ", ".join(str(other) for other in clashes[folder])
-            logger.error(f"\nFolder failed: {folder}\n  Its output folder {output_dir(folder)} is also used by "
-                         f"the images in {others}. Move one set of images into its own folder.")
-            failed_folders.append(folder)
+            failed[folder] = (f"Its output folder {output_dir(folder)} is also used by the images in {others}. "
+                              f"Move one set of images into its own folder.")
+            logger.error(f"\nFolder failed: {folder}\n  {failed[folder]}")
         elif folder in locked:
+            failed[folder] = failure_reason(locked[folder])
             logger.error(f"\nFolder failed: {folder}\n  {locked[folder]}")
-            failed_folders.append(folder)
-        elif not process_folder(folder, args):
-            failed_folders.append(folder)
+        elif (reason := process_folder(folder, args)) is not None:
+            failed[folder] = reason
 
-    if failed_folders:
-        logger.error(f"\nFinished with {len(failed_folders)} failed folder(s):")
-        for folder in failed_folders:
-            logger.error(f"  {folder}")
-    else:
-        logger.info("All folders converted.")
+    logger.removeHandler(warnings)  # The summary's own warnings aren't collected
+    exit_code = log_summary(input_folder, folders, failed, warnings.warnings)
     logger.info(f"Log written to: {log_file}")
-    return 1 if failed_folders else 0
+    return exit_code
 
 
 if __name__ == "__main__":

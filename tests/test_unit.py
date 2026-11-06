@@ -2,6 +2,7 @@
 import argparse
 import io
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,89 @@ def test_find_image_folders_skips_work_log_and_output_folders(tmp_path):
         touch(tmp_path / "a" / skipped / "sub", "x.jpg")
     found = sorted(ci.find_image_folders(tmp_path))
     assert found == [tmp_path, tmp_path / "a" / "master", tmp_path / "a" / "master" / "deeper"]
+
+
+def test_find_image_folders_warns_about_folders_with_only_unsupported_images(tmp_path, caplog):
+    touch(tmp_path, "a.tif")
+    touch(tmp_path / "pngs", "x.PNG", "notes.txt")
+    touch(tmp_path / "text", "notes.txt")
+    with caplog.at_level("WARNING", logger=ci.logger.name):
+        assert list(ci.find_image_folders(tmp_path)) == [tmp_path]
+    assert caplog.messages == [f"Skipped {tmp_path / 'pngs'}: its 1 image(s) are in a format that isn't converted: x.PNG"]
+
+
+def test_select_images_warns_about_unsupported_images(tmp_path, caplog):
+    touch(tmp_path, "a.tif", *(f"p{i}.png" for i in range(1, 8)), "b.bmp", "notes.txt")
+    with caplog.at_level("WARNING", logger=ci.logger.name):
+        assert [p.name for p in ci.select_images(tmp_path)] == ["a.tif"]
+    assert caplog.messages == [
+        "  Skipped 8 image(s) in a format that isn't converted: b.bmp, p1.png, p2.png, p3.png, p4.png and 3 more"]
+
+
+@pytest.mark.parametrize("names, text", [
+    (["a"], "a"),
+    (["a", "b"], "a and b"),
+    (["a", "b", "c", "d", "e"], "a, b, c, d and e"),
+    (["a", "b", "c", "d", "e", "f", "g"], "a, b, c, d, e and 2 more"),
+])
+def test_name_list(names, text):
+    assert ci.name_list(names) == text
+
+
+@pytest.mark.parametrize("error, reason", [
+    (ci.FolderError("These images would get the same JPEG name: a.jpg and a.tif"),
+     "These images would get the same JPEG name: a.jpg and a.tif"),
+    (RuntimeError("OCR failed for b01.pdf (OCRmyPDF exit code 2)"), "OCR failed for b01.pdf (OCRmyPDF exit code 2)"),
+    (OSError(28, "No space left on device"), "OSError: [Errno 28] No space left on device"),
+    (KeyError("x"), "KeyError: 'x'"),
+    (ValueError(), "ValueError"),
+    # ImageMagick: the error message without program name, file and source location; a warning first is skipped
+    (subprocess.CalledProcessError(1, ["magick", "b.tif"], stderr=(
+        b"magick: Unknown field with tag 292 (0x124) encountered. `TIFFReadDirectory' @ warning/tiff.c/TIFFWarnings/1001.\n"
+        b"magick: Cannot read TIFF header. `/scans/b.tif' @ error/tiff.c/TIFFErrors/571.\n")),
+     "Cannot read TIFF header."),
+    (subprocess.CalledProcessError(
+        1, ["convert", "b.tif"], stderr="convert: no images defined `b.jpg' @ error/convert.c/ConvertImageCommand/3229.\n"),
+     "no images defined"),
+    (subprocess.CalledProcessError(2, ["/usr/bin/tool", "x"], stderr=b"something broke\nmore\n"),
+     "tool failed (exit code 2): something broke"),
+    (subprocess.CalledProcessError(2, ["tool"]), "tool failed (exit code 2)"),
+])
+def test_failure_reason(error, reason):
+    assert ci.failure_reason(error) == reason
+
+
+def test_log_summary_groups_warnings_by_folder(tmp_path, caplog):
+    a, b = tmp_path / "a", tmp_path / "b"
+    warnings = [(None, "Ignoring --ocr-lang eng"), (a, "x.tif contains 2 images"), (b, "Skipped 1 image(s)"),
+                (a, "y.tif contains 3 images")]
+    with caplog.at_level("INFO", logger=ci.logger.name):
+        assert ci.log_summary(tmp_path, [a, b], {}, warnings) == 0
+    assert caplog.messages == [
+        "\n4 warning(s):", "  Ignoring --ocr-lang eng",
+        f"  {a}", "    x.tif contains 2 images", "    y.tif contains 3 images",
+        f"  {b}", "    Skipped 1 image(s)",
+        "\nAll folders converted, but check the warnings above.",
+    ]
+
+
+def test_log_summary_lists_failed_folders_with_reasons(tmp_path, caplog):
+    a, b = tmp_path / "a", tmp_path / "b"
+    with caplog.at_level("INFO", logger=ci.logger.name):
+        assert ci.log_summary(tmp_path, [a, b], {b: "Can't convert b.tif: Cannot read TIFF header."}, []) == 1
+    assert caplog.messages == ["\nFinished with 1 failed folder(s):", f"  {b}\n    Can't convert b.tif: Cannot read TIFF header."]
+
+
+def test_log_summary_all_converted(tmp_path, caplog):
+    with caplog.at_level("INFO", logger=ci.logger.name):
+        assert ci.log_summary(tmp_path, [tmp_path], {}, []) == 0
+    assert caplog.messages == ["\nAll folders converted."]
+
+
+def test_log_summary_no_folders_fails(tmp_path, caplog):
+    with caplog.at_level("INFO", logger=ci.logger.name):
+        assert ci.log_summary(tmp_path, [], {}, []) == 1
+    assert caplog.messages[-1].startswith(f"\nNo images found in {tmp_path} or its subfolders.")
 
 
 @pytest.mark.parametrize("folder, name", [
